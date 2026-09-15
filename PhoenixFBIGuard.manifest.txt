@@ -1,0 +1,4 @@
+version=3.3.1
+script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/main/phoenix_reconnect.lua
+sha256=23f7b85f953e9ea234374ca3c7ff3b29b4759a7feaabce46a2afd23098f4b740
+notes=Live GitHub update channel, wallet statistics, verified automatic updates

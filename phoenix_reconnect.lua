@@ -7,6 +7,7 @@ script_description('Phoenix reconnect, FBI uniform recovery, guard summon and st
 -- The launcher performs account login. This file never reads credentials.
 
 local CURRENT_VERSION='3.3.1'
+local DEFAULT_UPDATE_MANIFEST_URL='https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/main/PhoenixFBIGuard.manifest.txt'
 
 local S = {
     poll_ms=50, retry_delay=30, max_retry_delay=300, restart_grace=120,
@@ -39,7 +40,7 @@ local ROUTE = {
 
 local sf,clock,ready,fatal
 local cfg={enabled=true,reconnect_enabled=true,outfit_recovery=true,guard_recovery=true,home_protection=true,
- collision_bypass=true,stats_enabled=true,stats_home_only=true,update_enabled=true,update_manifest_url='https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/main/PhoenixFBIGuard.manifest.txt',
+ collision_bypass=true,stats_enabled=true,stats_home_only=true,update_enabled=true,update_manifest_url=DEFAULT_UPDATE_MANIFEST_URL,update_channel_initialized=false,
  last_uniform=false,last_model=-1,guard_active=false,guard_abandoned=false}
 local config_path,log_path,stats_path,target,deadline,last_state,connected_since
 local attempts,queued,blocked,announced=0,false,nil,false
@@ -91,6 +92,7 @@ local function load_config()
   elseif k=='stats_home_only' then cfg.stats_home_only=bool(v,cfg.stats_home_only)
   elseif k=='update_enabled' then cfg.update_enabled=bool(v,cfg.update_enabled)
   elseif k=='update_manifest_url' then cfg.update_manifest_url=trim(v)
+  elseif k=='update_channel_initialized' then cfg.update_channel_initialized=bool(v,cfg.update_channel_initialized)
   elseif k=='last_uniform' then cfg.last_uniform=bool(v,cfg.last_uniform)
   elseif k=='last_model' then cfg.last_model=tonumber(v) or cfg.last_model
   elseif k=='collision_bypass' then cfg.collision_bypass=bool(v,cfg.collision_bypass) end
@@ -114,6 +116,7 @@ local function save_config()
   '\n','guard_recovery=',tostring(cfg.guard_recovery),'\n','home_protection=',tostring(cfg.home_protection),
   '\n','stats_enabled=',tostring(cfg.stats_enabled),'\n','stats_home_only=',tostring(cfg.stats_home_only),
   '\n','update_enabled=',tostring(cfg.update_enabled),'\n','update_manifest_url=',cfg.update_manifest_url,
+  '\n','update_channel_initialized=',tostring(cfg.update_channel_initialized),
   '\n','last_model=',tostring(cfg.last_model),'\n','collision_bypass=',tostring(cfg.collision_bypass),
   '\n','guard_active=',tostring(cfg.guard_active),'\n','guard_abandoned=',tostring(cfg.guard_abandoned),
   '\n','retry_delay=',S.retry_delay,'\n','max_retry_delay=',S.max_retry_delay,
@@ -847,11 +850,11 @@ local function update_command(args)
   if lower=='check' then start_update_check(true)
   else tell(string.format('Updater: %s | current=%s | latest=%s',updater.status,CURRENT_VERSION,tostring(updater.latest or 'unknown'))); if updater.last_error then tell(updater.last_error,0xFFD280) end end
  elseif lower=='url clear' then
-  cfg.update_manifest_url=''; updater.status='NOT CONFIGURED'; save_config(); if sync_gui then sync_gui() end
+  cfg.update_manifest_url=''; cfg.update_channel_initialized=true; updater.status='NOT CONFIGURED'; save_config(); if sync_gui then sync_gui() end
   tell('Update channel URL cleared.')
  elseif lower:sub(1,4)=='url ' then
   local url=trim(raw:sub(5)); if url~='' and not url:match('^https://') then tell('Update URL must use HTTPS.',0xFF9090); return end
-  cfg.update_manifest_url=url; updater.status=url=='' and 'NOT CONFIGURED' or 'READY'; save_config(); if sync_gui then sync_gui() end
+  cfg.update_manifest_url=url; cfg.update_channel_initialized=true; updater.status=url=='' and 'NOT CONFIGURED' or 'READY'; save_config(); if sync_gui then sync_gui() end
   tell(url=='' and 'Update channel URL cleared.' or 'Update channel saved. Use /phupdate check.')
  else tell('Commands: /phupdate check | status | on | off | url https://... | url clear') end
 end
@@ -969,7 +972,7 @@ local function setup_gui()
   imgui.InputText('Manifest HTTPS URL',gui_values.update_url,512)
   if imgui.Button('Save update channel') then
    local url=trim(ffi.string(gui_values.update_url)); if url=='' or url:match('^https://') then
-    cfg.update_manifest_url=url; updater.status=url=='' and 'NOT CONFIGURED' or 'READY'; save_config(); tell('Update channel saved.')
+    cfg.update_manifest_url=url; cfg.update_channel_initialized=true; updater.status=url=='' and 'NOT CONFIGURED' or 'READY'; save_config(); tell('Update channel saved.')
    else tell('Update manifest URL must use HTTPS.',0xFF9090) end
   end
   imgui.SameLine()
@@ -1074,7 +1077,12 @@ function main()
  local cok,ce=init_clock(); if not cok then print('[PhoenixFBI] Clock initialization failed: '..tostring(ce)); return end
  local dir=getWorkingDirectory()..'\\config'; if not doesDirectoryExist(dir) then createDirectory(dir) end
  config_path=dir..'\\PhoenixFBIGuard.ini'; stats_path=dir..'\\PhoenixFBIGuard_stats.csv'; log_path=getWorkingDirectory()..'\\PhoenixFBIGuard.log'
- load_config(); load_stats(); save_config(); save_stats(); default_destination()
+ load_config()
+ if not cfg.update_channel_initialized then
+  cfg.update_manifest_url=DEFAULT_UPDATE_MANIFEST_URL
+  cfg.update_channel_initialized=true
+ end
+ load_stats(); save_config(); save_stats(); default_destination()
  local hash_ok=bit_ok and sha256('abc')=='ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
  if bit_ok and not hash_ok then log('Updater disabled: internal SHA-256 self-test failed.') end
  updater.available=hash_ok and type(downloadUrlToFile)=='function' and type(doesFileExist)=='function' and type(thisScript)=='function' and type(lua_thread)=='table'

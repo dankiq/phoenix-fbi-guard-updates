@@ -1,4 +1,4 @@
-version=3.4.0
-script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/22dfff11bbb817724eeaaedcb8eb6eb84315ff0c/phoenix_reconnect.lua
-sha256=5cee9a425e71d6cdc4cc3726a2c49fa46974d566bb1289c356a2a98083bd9927
-notes=Farm spawn #4, 30-minute 15-unit position watchdog and continuous reconnect
+version=3.4.1
+script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/0051679feb9ae02a1e4991b43f2eb11be5a79e09/phoenix_reconnect.lua
+sha256=6c45322d59c1819c477a4afdc5d21cfa062757ba30d6cd36a5199733e0a11c44
+notes=Farm spawn by name at item 5 or 6, 30-minute position watchdog and continuous reconnect

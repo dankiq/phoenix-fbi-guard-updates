@@ -1,4 +1,4 @@
-version=3.3.1
-script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/main/phoenix_reconnect.lua
-sha256=23bdaf846dd8aa8a64a38857d5332b88e7c2a0f3757ea605bcc1fad523ac3289
-notes=Live GitHub update channel with legacy-config migration and wallet statistics
+version=3.4.0
+script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/22dfff11bbb817724eeaaedcb8eb6eb84315ff0c/phoenix_reconnect.lua
+sha256=5cee9a425e71d6cdc4cc3726a2c49fa46974d566bb1289c356a2a98083bd9927
+notes=Farm spawn #4, 30-minute 15-unit position watchdog and continuous reconnect

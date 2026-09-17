@@ -1,38 +1,40 @@
 script_name('Phoenix FBI Guard')
 script_author('Codex')
-script_version('3.4.0')
+script_version('3.4.1')
 script_description('Phoenix reconnect, Farm spawn recovery, wallet statistics and standing AFK')
 
 -- Calibrated from an official Arizona Launcher / Phoenix trace, 2026-09-14.
 -- The launcher performs account login. This file never reads credentials.
 
-local CURRENT_VERSION='3.4.0'
+local CURRENT_VERSION='3.4.1'
 local DEFAULT_UPDATE_MANIFEST_URL='https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/main/PhoenixFBIGuard.manifest.txt'
 
 local S = {
     poll_ms=50, retry_delay=30, max_retry_delay=300, restart_grace=120,
     join_timeout=180, stable_reset=60, login_attention_timeout=120,
-    spawn_screen_delay=1.45, spawn_timeout=50, spawn_settle=1,
+    spawn_screen_delay=1.45, spawn_list_grace=2, spawn_timeout=50, spawn_settle=1,
     key_step=.28, farm_watch_interval=1800, wait_connect_grace=45,
     stats_poll_interval=2, update_check_interval=21600, update_timeout=45
 }
-local FARM_SPAWN_INDEX=4
+local FARM_DEFAULT_INDEX=5
 local VK_RETURN,VK_UP,VK_DOWN,VK_F10=0x0D,0x26,0x28,0x79
 
 local sf,clock,ready,fatal
 local cfg={enabled=true,reconnect_enabled=true,stats_enabled=true,update_enabled=true,
  update_manifest_url=DEFAULT_UPDATE_MANIFEST_URL,update_channel_initialized=false,
- stats_farm_only=true,farm_protection=true,farm_calibrated=false,farm_x=0,farm_y=0,farm_z=0,farm_interior=0,farm_radius=15}
+ stats_farm_only=true,farm_protection=true,farm_calibrated=false,farm_x=0,farm_y=0,farm_z=0,farm_interior=0,farm_radius=15,
+ farm_spawn_index_mode=0}
 local config_path,log_path,stats_path,target,deadline,last_state,connected_since
 local attempts,queued,blocked,announced=0,false,nil,false
 local login_attention_reported=false
 local temporary_password_lock,password_retry_due=false,nil
 local transport_closed,transport_retry_due,transport_close_reason=false,nil,nil
 local keys,held={},{}
-local ui={spawn_scheduled=false}
+local ui={spawn_scheduled=false,spawn_pending_at=nil}
 local flow={phase='BOOT',desired=nil,since=0,due=nil,spawned=false,spawn_at=nil,
  farm_check_at=0,farm_retry_at=nil,
- farm_spawn_requested=false,farm_relog_attempts=0}
+ farm_spawn_requested=false,farm_relog_attempts=0,spawn_index=nil,spawn_index_source=nil,
+ spawn_confirmed=false,next_spawn_index=nil}
 local gui_ok,imgui=pcall(require,'mimgui')
 local gui_open,gui_values,gui_frame,sync_gui
 local recent_logs={}
@@ -61,6 +63,7 @@ local function tell(m,c) log(m); if ready then sampAddChatMessage('[PhoenixFBI] 
 
 local function load_config()
  local f=io.open(config_path,'r'); if not f then return end
+ local calibration_version_seen=false
  for line in f:lines() do
   local k,v=line:match('^%s*([%w_]+)%s*=%s*(.-)%s*$')
   if k=='enabled' then cfg.enabled=bool(v,cfg.enabled)
@@ -77,6 +80,9 @@ local function load_config()
   elseif k=='farm_z' then cfg.farm_z=tonumber(v) or cfg.farm_z
   elseif k=='farm_interior' then cfg.farm_interior=tonumber(v) or cfg.farm_interior
   elseif k=='farm_radius' then cfg.farm_radius=clamp(v,5,100,cfg.farm_radius)
+  elseif k=='farm_spawn_index_mode' then
+   local index=tonumber(v); if index==0 or index==5 or index==6 then cfg.farm_spawn_index_mode=index end
+  elseif k=='farm_calibration_version' then calibration_version_seen=tonumber(v)==2
   end
   if k=='retry_delay' then S.retry_delay=clamp(v,15,300,S.retry_delay) end
   if k=='max_retry_delay' then S.max_retry_delay=clamp(v,60,900,S.max_retry_delay) end
@@ -86,6 +92,10 @@ local function load_config()
   if k=='farm_watch_interval' then S.farm_watch_interval=clamp(v,300,14400,S.farm_watch_interval) end
  end
  f:close()
+ if cfg.farm_calibrated and not calibration_version_seen then
+  cfg.farm_calibrated=false
+  log('Old Farm calibration cleared: the former #4 selection could have recorded another location.')
+ end
 end
 local function save_config()
  local f,e=io.open(config_path,'w'); if not f then log('Cannot save config: '..tostring(e)); return false end
@@ -99,6 +109,8 @@ local function save_config()
   '\n','farm_calibrated=',tostring(cfg.farm_calibrated),
   '\n','farm_x=',tostring(cfg.farm_x),'\n','farm_y=',tostring(cfg.farm_y),'\n','farm_z=',tostring(cfg.farm_z),
   '\n','farm_interior=',tostring(cfg.farm_interior),'\n','farm_radius=',tostring(cfg.farm_radius),
+  '\n','farm_spawn_index_mode=',tostring(cfg.farm_spawn_index_mode),
+  '\n','farm_calibration_version=2',
   '\n','retry_delay=',S.retry_delay,'\n','max_retry_delay=',S.max_retry_delay,
   '\n','restart_grace=',S.restart_grace,'\n','wait_connect_grace=',S.wait_connect_grace,
   '\n','join_timeout=',S.join_timeout,'\n','farm_watch_interval=',S.farm_watch_interval,'\n')
@@ -366,23 +378,55 @@ local function phase(name,now,msg)
  if msg then tell(msg) end
 end
 local function clear_ui()
- ui.spawn_scheduled=false
+ ui.spawn_scheduled=false; ui.spawn_pending_at=nil
  flow.spawned,flow.spawn_at=false,nil
 end
 local function default_destination()
  flow.desired='farm'
 end
 
-local function schedule_spawn(now)
+local function farm_index_from_spawn_list(message)
+ if not message or not message:find('event.auth.initializeSpawnPoints',1,true) then return nil end
+ local count=0
+ for label in message:gmatch('"spawn"%s*:%s*"([^"\\]*)"') do
+  count=count+1
+  local lower=label:lower()
+  if lower=='farm' or lower:match('^farm[%s%p]') or lower:find('ферм',1,true) or lower:find('Ферм',1,true) then
+   return count
+  end
+ end
+ return nil
+end
+
+local function has_last_exit_option(message)
+ if not message then return false end
+ local lower=message:lower()
+ return (lower:find('last',1,true) and lower:find('exit',1,true)) or
+  (message:find('последн',1,true) and message:find('выход',1,true)) or
+  (message:find('Последн',1,true) and message:find('выход',1,true))
+end
+
+local function choose_farm_index(message)
+ if cfg.farm_spawn_index_mode~=0 then return cfg.farm_spawn_index_mode,'manual override',true end
+ local index=farm_index_from_spawn_list(message)
+ if index and index<=12 then return index,'spawn list name',true end
+ if has_last_exit_option(message) then return 6,'last-exit option',true end
+ if flow.next_spawn_index then return flow.next_spawn_index,'alternate after wrong spawn',false end
+ return FARM_DEFAULT_INDEX,'fallback; list unavailable',false
+end
+
+local function schedule_spawn(now,message)
  if ui.spawn_scheduled or sampIsLocalPlayerSpawned() or not cfg.enabled then return end
- ui.spawn_scheduled=true
- local index=FARM_SPAWN_INDEX
+ ui.spawn_scheduled=true; ui.spawn_pending_at=nil
+ local index,source,confirmed=choose_farm_index(message)
+ flow.spawn_index,flow.spawn_index_source,flow.spawn_confirmed=index,source,confirmed
+ flow.next_spawn_index=nil
  flow.farm_spawn_requested=true
  local at=now+S.spawn_screen_delay
  for _=1,8 do pulse(VK_UP,at,.16); at=at+S.key_step end
  for _=2,index do pulse(VK_DOWN,at,.16); at=at+S.key_step end
  pulse(VK_RETURN,at,.20)
- phase('WAIT_SPAWN',now,string.format('Selecting Farm spawn (menu item %d).',index))
+ phase('WAIT_SPAWN',now,string.format('Selecting Farm spawn (menu item %d; %s).',index,source))
 end
 
 local function read_arizona(bs,sub)
@@ -414,10 +458,13 @@ end
 local function reconnect_to_farm(now,reason)
  if flow.farm_relog_attempts>=2 then
   release_keys(); flow.farm_retry_at=now+S.farm_watch_interval
-  phase('WAIT_FARM_RETRY',now,string.format('Farm was not reached after two relogs. Retrying in %d minutes; check menu item #4.',math.floor(S.farm_watch_interval/60)))
+  phase('WAIT_FARM_RETRY',now,string.format('Farm was not reached after two relogs. Retrying in %d minutes; check spawn list and calibration.',math.floor(S.farm_watch_interval/60)))
   return
  end
  flow.farm_relog_attempts=flow.farm_relog_attempts+1
+ if cfg.farm_spawn_index_mode==0 and flow.spawn_index and not flow.spawn_confirmed then
+  flow.next_spawn_index=flow.spawn_index==5 and 6 or 5
+ end
  release_keys(); clear_ui(); flow.farm_spawn_requested=false; flow.desired='farm'
  phase('RECONNECTING_FARM',now,string.format('%s Relog to Farm (%d/2 before cooldown).',reason,flow.farm_relog_attempts))
  local ok,e=pcall(sampProcessChatInput,'/reconnect')
@@ -440,11 +487,15 @@ local function farm_tick(now)
   phase('SPAWN_SETTLE',now,'Character appeared; checking Farm position.'); return
  end
  if flow.phase=='SPAWN_SETTLE' and now-flow.spawn_at>=S.spawn_settle then
-  if not cfg.farm_calibrated and flow.farm_spawn_requested then
+  if not cfg.farm_calibrated and flow.farm_spawn_requested and flow.spawn_confirmed then
    local x,y,z=getCharCoordinates(PLAYER_PED)
    cfg.farm_x,cfg.farm_y,cfg.farm_z=x,y,z
    cfg.farm_interior=getCharActiveInterior(PLAYER_PED); cfg.farm_calibrated=true; save_config()
-   tell(string.format('Menu item #4 spawn recorded at %.1f / %.1f / %.1f, interior %d. Confirm on screen that this is Farm.',x,y,z,cfg.farm_interior),0xFFD280)
+   tell(string.format('Farm spawn #%d recorded at %.1f / %.1f / %.1f, interior %d. Confirm on screen that this is Farm.',flow.spawn_index,x,y,z,cfg.farm_interior),0xFFD280)
+  end
+  if not cfg.farm_calibrated and flow.farm_spawn_requested and not flow.spawn_confirmed then
+   flow.farm_spawn_requested=false; flow.farm_retry_at=now+S.farm_watch_interval
+   phase('WAIT_FARM_CALIBRATION',now,'Spawn list did not identify Farm. Check location and use /phfarm calibrate; automatic calibration is paused.'); return
   end
   if is_inside_farm() then
    flow.farm_relog_attempts=0; flow.farm_spawn_requested=false; flow.farm_retry_at=nil; flow.farm_check_at=now+S.farm_watch_interval
@@ -465,6 +516,7 @@ end
 local function flow_tick(now,state)
  tick_keys(now)
  if not cfg.enabled or state~=sf.GAMESTATE_CONNECTED then return end
+ if ui.spawn_pending_at and now>=ui.spawn_pending_at then schedule_spawn(now) end
  farm_tick(now)
 end
 
@@ -548,8 +600,9 @@ local function state_name(state)
 end
 
 local function status()
- tell(string.format('%s | state=%s | workflow=%s | destination=Farm (#4) | calibrated=%s | relog=%d/2 | restart-lock=%s | transport-close=%s',
+ tell(string.format('%s | state=%s | workflow=%s | destination=Farm (auto 5/6) | last-menu=%s | calibrated=%s | relog=%d/2 | restart-lock=%s | transport-close=%s',
   cfg.enabled and 'ON' or 'OFF',state_name(last_state),flow.phase,
+  tostring(flow.spawn_index or '?'),
   cfg.farm_calibrated and 'YES' or 'NO',flow.farm_relog_attempts,
   temporary_password_lock and 'WAITING' or 'NO',transport_closed and 'WAITING' or 'NO'))
  if blocked then tell('Stopped: '..blocked) end
@@ -605,6 +658,11 @@ local function farm_command(args)
   flow.farm_check_at=clock()+S.farm_watch_interval; phase('DONE',clock()); save_config(); reset_money_baseline()
   tell(string.format('Farm position saved: %.1f / %.1f / %.1f, interior %d.',x,y,z,cfg.farm_interior))
  elseif args=='forget' then cfg.farm_calibrated=false; save_config(); reset_money_baseline(); tell('Farm position forgotten; next selected Farm spawn will be recorded.')
+ elseif args=='index auto' then
+  cfg.farm_spawn_index_mode=0; save_config(); tell('Farm spawn menu selection: automatic by name, then 5/6 fallback.')
+ elseif args=='index 5' or args=='index 6' then
+  cfg.farm_spawn_index_mode=tonumber(args:match('%d+')); save_config()
+  tell('Farm spawn menu item forced to #'..cfg.farm_spawn_index_mode..'. Use /phfarm index auto to restore automatic selection.')
  elseif args:match('^radius %d+$') then
   cfg.farm_radius=clamp(args:match('%d+'),5,100,cfg.farm_radius)
   save_config(); if sync_gui then sync_gui() end; reset_money_baseline()
@@ -616,8 +674,10 @@ local function farm_command(args)
   save_config(); if sync_gui then sync_gui() end
   tell('Farm position check every '..math.floor(S.farm_watch_interval/60)..' minutes.')
  else
-  tell(string.format('Farm menu #%d | calibrated=%s | center=%.1f / %.1f / %.1f | interior=%d | radius=%d | check=%d min',
-   FARM_SPAWN_INDEX,cfg.farm_calibrated and 'YES' or 'NO',cfg.farm_x,cfg.farm_y,cfg.farm_z,cfg.farm_interior,cfg.farm_radius,math.floor(S.farm_watch_interval/60)))
+  tell(string.format('Farm menu=%s | last-selected=%s (%s) | calibrated=%s | center=%.1f / %.1f / %.1f | interior=%d | radius=%d | check=%d min',
+   cfg.farm_spawn_index_mode==0 and 'auto 5/6' or tostring(cfg.farm_spawn_index_mode),
+   tostring(flow.spawn_index or '?'),tostring(flow.spawn_index_source or '?'),
+   cfg.farm_calibrated and 'YES' or 'NO',cfg.farm_x,cfg.farm_y,cfg.farm_z,cfg.farm_interior,cfg.farm_radius,math.floor(S.farm_watch_interval/60)))
   tell('Commands: /phfarm calibrate | forget | radius 15 | interval 30 | status')
  end
 end
@@ -687,13 +747,13 @@ local function setup_gui()
   local io=imgui.GetIO()
   imgui.SetNextWindowPos(imgui.ImVec2(io.DisplaySize.x/2,io.DisplaySize.y/2),imgui.Cond.FirstUseEver,imgui.ImVec2(.5,.5))
   imgui.SetNextWindowSize(imgui.ImVec2(620,720),imgui.Cond.FirstUseEver)
-  imgui.Begin('Phoenix Farm Guard 3.4.0',gui_open,imgui.WindowFlags.NoCollapse)
+  imgui.Begin('Phoenix Farm Guard 3.4.1',gui_open,imgui.WindowFlags.NoCollapse)
   imgui.Text('LIVE STATUS')
   imgui.Separator()
   imgui.Text('Connection state: '..state_name(last_state))
   imgui.Text('Workflow: '..tostring(flow.phase)..'   Destination: '..tostring(flow.desired or 'auto'))
   imgui.Text('Reconnect attempts: '..tostring(attempts)..'   Queue: '..(queued and 'YES' or 'NO'))
-  imgui.Text('Farm: menu item #4   Calibration: '..(cfg.farm_calibrated and 'YES' or 'NO'))
+  imgui.Text('Farm: menu auto 5/6   Last selected: '..tostring(flow.spawn_index or '?')..'   Calibration: '..(cfg.farm_calibrated and 'YES' or 'NO'))
   imgui.Text(string.format('Farm center: %.1f / %.1f / %.1f   Interior: %d',cfg.farm_x,cfg.farm_y,cfg.farm_z,cfg.farm_interior))
   if sampIsLocalPlayerSpawned() then
    local ok,x,y,z=pcall(getCharCoordinates,PLAYER_PED)
@@ -772,9 +832,12 @@ function onReceivePacket(id,bs)
  if id==220 then
   local m=read_arizona(bs,17)
   if m then
-   if not sampIsLocalPlayerSpawned() and
-      (m:find('event.auth.initializeSpawnPoints',1,true) or m:find('event.auth.updateVideoBackgroundVisible',1,true)) then
-    schedule_spawn(clock())
+   if not sampIsLocalPlayerSpawned() then
+    if m:find('event.auth.initializeSpawnPoints',1,true) then
+     schedule_spawn(clock(),m)
+    elseif m:find('event.auth.updateVideoBackgroundVisible',1,true) and not ui.spawn_scheduled then
+     ui.spawn_pending_at=ui.spawn_pending_at or clock()+S.spawn_list_grace
+    end
    end
   end
   return
@@ -868,7 +931,7 @@ function main()
  if not sampRegisterChatCommand('phfarm',farm_command) then tell('Command /phfarm is already registered.',0xFFD280) end
  if not sampRegisterChatCommand('phupdate',update_command) then tell('Command /phupdate is already registered.',0xFFD280) end
  setup_gui()
- tell('v3.4.0 loaded. Farm spawn #4, wallet statistics and verified updater are ready. /phrec status')
+ tell('v3.4.1 loaded. Farm spawn auto 5/6, wallet statistics and verified updater are ready. /phrec status')
  while true do
   if isSampAvailable() then
    local step_ok,step_error=pcall(function()

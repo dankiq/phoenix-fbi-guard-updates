@@ -1,40 +1,58 @@
 script_name('Phoenix FBI Guard')
 script_author('Codex')
-script_version('3.4.1')
-script_description('Phoenix reconnect, Farm spawn recovery, wallet statistics and standing AFK')
+script_version('3.5.0')
+script_description('Phoenix reconnect, FBI uniform recovery, guard summon and standing AFK')
 
 -- Calibrated from an official Arizona Launcher / Phoenix trace, 2026-09-14.
 -- The launcher performs account login. This file never reads credentials.
 
-local CURRENT_VERSION='3.4.1'
+local CURRENT_VERSION='3.5.0'
 local DEFAULT_UPDATE_MANIFEST_URL='https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/main/PhoenixFBIGuard.manifest.txt'
 
 local S = {
     poll_ms=50, retry_delay=30, max_retry_delay=300, restart_grace=120,
     join_timeout=180, stable_reset=60, login_attention_timeout=120,
-    spawn_screen_delay=1.45, spawn_list_grace=2, spawn_timeout=50, spawn_settle=1,
-    key_step=.28, farm_watch_interval=1800, wait_connect_grace=45,
-    stats_poll_interval=2, update_check_interval=21600, update_timeout=45
+    spawn_screen_delay=1.45, spawn_timeout=50, spawn_settle=1,
+    route_timeout=65, route_stall=5, locker_timeout=15,
+    guard_timeout=20, guard_cycle_timeout=40, collision_refresh=.5, key_step=.28,
+    home_watch_interval=2, wait_connect_grace=45,
+    guard_scan_radius=18, stats_poll_interval=2, update_check_interval=21600, update_timeout=45
 }
-local FARM_DEFAULT_INDEX=5
-local VK_RETURN,VK_UP,VK_DOWN,VK_F10=0x0D,0x26,0x28,0x79
+local FBI_INTERIOR, HOME_INTERIOR = 187, 198
+local FBI_MODEL, CIVIL_MODEL = 286, 6560
+local FBI_SPAWN_INDEX, HOME_SPAWN_INDEX, GUARD_ID = 3, 2, 2
+local HOME_X,HOME_Y,HOME_Z,HOME_RADIUS = -1413.2,-219.4,1501.0,18
+local VK_RETURN,VK_MENU,VK_ESCAPE,VK_SPACE=0x0D,0x12,0x1B,0x20
+local VK_HOME,VK_UP,VK_DOWN,VK_H,VK_I,VK_W,VK_F10=0x24,0x26,0x28,0x48,0x49,0x57,0x79
+
+local ROUTE = {
+ {x=92.62,y=-168.70,z=1022.74,t=1.80,a='door'},
+ {x=89.10,y=-168.70,z=1022.75,t=.70},
+ {x=88.51,y=-165.30,z=1022.75,t=.70},
+ {x=88.51,y=-154.00,z=1022.75,t=.80},
+ {x=88.51,y=-136.50,z=1022.75,t=.85},
+ {x=88.51,y=-121.00,z=1022.75,t=.75},
+ {x=86.10,y=-122.96,z=1022.74,t=1.55,a='door'},
+ {x=84.75,y=-123.35,z=1022.74,t=.70},
+ {x=82.00,y=-120.55,z=1022.74,t=.70},
+ {x=80.35,y=-120.22,z=1022.74,t=.72,a='locker'}
+}
 
 local sf,clock,ready,fatal
-local cfg={enabled=true,reconnect_enabled=true,stats_enabled=true,update_enabled=true,
- update_manifest_url=DEFAULT_UPDATE_MANIFEST_URL,update_channel_initialized=false,
- stats_farm_only=true,farm_protection=true,farm_calibrated=false,farm_x=0,farm_y=0,farm_z=0,farm_interior=0,farm_radius=15,
- farm_spawn_index_mode=0}
+local cfg={enabled=true,reconnect_enabled=true,outfit_recovery=true,guard_recovery=true,home_protection=true,
+ collision_bypass=true,stats_enabled=true,stats_home_only=true,update_enabled=true,update_manifest_url=DEFAULT_UPDATE_MANIFEST_URL,update_channel_initialized=false,
+ last_uniform=false,last_model=-1,guard_active=false,guard_abandoned=false}
 local config_path,log_path,stats_path,target,deadline,last_state,connected_since
 local attempts,queued,blocked,announced=0,false,nil,false
 local login_attention_reported=false
 local temporary_password_lock,password_retry_due=false,nil
 local transport_closed,transport_retry_due,transport_close_reason=false,nil,nil
 local keys,held={},{}
-local ui={spawn_scheduled=false,spawn_pending_at=nil}
+local collision={active=false,changed={},next_refresh=0}
+local ui={spawn_scheduled=false,inventory=false,locker=false,promo_due=nil}
 local flow={phase='BOOT',desired=nil,since=0,due=nil,spawned=false,spawn_at=nil,
- farm_check_at=0,farm_retry_at=nil,
- farm_spawn_requested=false,farm_relog_attempts=0,spawn_index=nil,spawn_index_source=nil,
- spawn_confirmed=false,next_spawn_index=nil}
+ route_i=1,route_at=nil,best=nil,progress_at=nil,retries=0,locker_attempts=0,acted=nil,
+ home_check_at=0,outfit_attempts=0,outfit_abandoned=false,guard_attempts=0,guard_started_at=nil}
 local gui_ok,imgui=pcall(require,'mimgui')
 local gui_open,gui_values,gui_frame,sync_gui
 local recent_logs={}
@@ -63,61 +81,60 @@ local function tell(m,c) log(m); if ready then sampAddChatMessage('[PhoenixFBI] 
 
 local function load_config()
  local f=io.open(config_path,'r'); if not f then return end
- local calibration_version_seen=false
+ local farm_config=false
  for line in f:lines() do
   local k,v=line:match('^%s*([%w_]+)%s*=%s*(.-)%s*$')
+  if k=='farm_protection' or k=='farm_calibrated' then farm_config=true end
   if k=='enabled' then cfg.enabled=bool(v,cfg.enabled)
   elseif k=='reconnect_enabled' then cfg.reconnect_enabled=bool(v,cfg.reconnect_enabled)
+  elseif k=='outfit_recovery' then cfg.outfit_recovery=bool(v,cfg.outfit_recovery)
+  elseif k=='guard_recovery' then cfg.guard_recovery=bool(v,cfg.guard_recovery)
+  elseif k=='home_protection' then cfg.home_protection=bool(v,cfg.home_protection)
   elseif k=='stats_enabled' then cfg.stats_enabled=bool(v,cfg.stats_enabled)
+  elseif k=='stats_home_only' then cfg.stats_home_only=bool(v,cfg.stats_home_only)
   elseif k=='update_enabled' then cfg.update_enabled=bool(v,cfg.update_enabled)
   elseif k=='update_manifest_url' then cfg.update_manifest_url=trim(v)
   elseif k=='update_channel_initialized' then cfg.update_channel_initialized=bool(v,cfg.update_channel_initialized)
-  elseif k=='stats_farm_only' then cfg.stats_farm_only=bool(v,cfg.stats_farm_only)
-  elseif k=='farm_protection' then cfg.farm_protection=bool(v,cfg.farm_protection)
-  elseif k=='farm_calibrated' then cfg.farm_calibrated=bool(v,cfg.farm_calibrated)
-  elseif k=='farm_x' then cfg.farm_x=tonumber(v) or cfg.farm_x
-  elseif k=='farm_y' then cfg.farm_y=tonumber(v) or cfg.farm_y
-  elseif k=='farm_z' then cfg.farm_z=tonumber(v) or cfg.farm_z
-  elseif k=='farm_interior' then cfg.farm_interior=tonumber(v) or cfg.farm_interior
-  elseif k=='farm_radius' then cfg.farm_radius=clamp(v,5,100,cfg.farm_radius)
-  elseif k=='farm_spawn_index_mode' then
-   local index=tonumber(v); if index==0 or index==5 or index==6 then cfg.farm_spawn_index_mode=index end
-  elseif k=='farm_calibration_version' then calibration_version_seen=tonumber(v)==2
-  end
+  elseif k=='last_uniform' then cfg.last_uniform=bool(v,cfg.last_uniform)
+  elseif k=='last_model' then cfg.last_model=tonumber(v) or cfg.last_model
+  elseif k=='collision_bypass' then cfg.collision_bypass=bool(v,cfg.collision_bypass) end
+  if k=='guard_active' then cfg.guard_active=bool(v,cfg.guard_active) end
+  if k=='guard_abandoned' then cfg.guard_abandoned=bool(v,cfg.guard_abandoned) end
   if k=='retry_delay' then S.retry_delay=clamp(v,15,300,S.retry_delay) end
   if k=='max_retry_delay' then S.max_retry_delay=clamp(v,60,900,S.max_retry_delay) end
   if k=='restart_grace' then S.restart_grace=clamp(v,30,600,S.restart_grace) end
   if k=='wait_connect_grace' then S.wait_connect_grace=clamp(v,15,300,S.wait_connect_grace) end
   if k=='join_timeout' then S.join_timeout=clamp(v,30,600,S.join_timeout) end
-  if k=='farm_watch_interval' then S.farm_watch_interval=clamp(v,300,14400,S.farm_watch_interval) end
+  if k=='route_timeout' then S.route_timeout=clamp(v,30,180,S.route_timeout) end
+  if k=='guard_timeout' then S.guard_timeout=clamp(v,5,60,S.guard_timeout) end
+  if k=='guard_cycle_timeout' then S.guard_cycle_timeout=clamp(v,15,120,S.guard_cycle_timeout) end
  end
  f:close()
- if cfg.farm_calibrated and not calibration_version_seen then
-  cfg.farm_calibrated=false
-  log('Old Farm calibration cleared: the former #4 selection could have recorded another location.')
+ if farm_config then
+  cfg.enabled,cfg.reconnect_enabled=true,true
+  cfg.outfit_recovery,cfg.guard_recovery,cfg.home_protection=true,true,true
+  cfg.collision_bypass,cfg.last_uniform=true,false
+  cfg.guard_active,cfg.guard_abandoned=false,false
  end
 end
 local function save_config()
  local f,e=io.open(config_path,'w'); if not f then log('Cannot save config: '..tostring(e)); return false end
- f:write('[settings]\n','enabled=',tostring(cfg.enabled),
-  '\n','reconnect_enabled=',tostring(cfg.reconnect_enabled),
-  '\n','stats_enabled=',tostring(cfg.stats_enabled),
+ f:write('[settings]\n','enabled=',tostring(cfg.enabled),'\n','last_uniform=',tostring(cfg.last_uniform),
+  '\n','reconnect_enabled=',tostring(cfg.reconnect_enabled),'\n','outfit_recovery=',tostring(cfg.outfit_recovery),
+  '\n','guard_recovery=',tostring(cfg.guard_recovery),'\n','home_protection=',tostring(cfg.home_protection),
+  '\n','stats_enabled=',tostring(cfg.stats_enabled),'\n','stats_home_only=',tostring(cfg.stats_home_only),
   '\n','update_enabled=',tostring(cfg.update_enabled),'\n','update_manifest_url=',cfg.update_manifest_url,
   '\n','update_channel_initialized=',tostring(cfg.update_channel_initialized),
-  '\n','stats_farm_only=',tostring(cfg.stats_farm_only),
-  '\n','farm_protection=',tostring(cfg.farm_protection),
-  '\n','farm_calibrated=',tostring(cfg.farm_calibrated),
-  '\n','farm_x=',tostring(cfg.farm_x),'\n','farm_y=',tostring(cfg.farm_y),'\n','farm_z=',tostring(cfg.farm_z),
-  '\n','farm_interior=',tostring(cfg.farm_interior),'\n','farm_radius=',tostring(cfg.farm_radius),
-  '\n','farm_spawn_index_mode=',tostring(cfg.farm_spawn_index_mode),
-  '\n','farm_calibration_version=2',
+  '\n','last_model=',tostring(cfg.last_model),'\n','collision_bypass=',tostring(cfg.collision_bypass),
+  '\n','guard_active=',tostring(cfg.guard_active),'\n','guard_abandoned=',tostring(cfg.guard_abandoned),
   '\n','retry_delay=',S.retry_delay,'\n','max_retry_delay=',S.max_retry_delay,
   '\n','restart_grace=',S.restart_grace,'\n','wait_connect_grace=',S.wait_connect_grace,
-  '\n','join_timeout=',S.join_timeout,'\n','farm_watch_interval=',S.farm_watch_interval,'\n')
+  '\n','join_timeout=',S.join_timeout,'\n','route_timeout=',S.route_timeout,
+  '\n','guard_timeout=',S.guard_timeout,'\n','guard_cycle_timeout=',S.guard_cycle_timeout,'\n')
  f:close(); return true
 end
 
-local is_inside_farm
+local is_inside_home
 
 local function load_stats()
  earnings.days={}
@@ -169,7 +186,7 @@ local function stats_tick(now,state)
  if not cfg.stats_enabled or state~=sf.GAMESTATE_CONNECTED or not sampIsLocalPlayerSpawned() then
   earnings.last_money,earnings.candidate_money,earnings.candidate_count=nil,nil,0; earnings.context_since=now; earnings.next_poll=now+S.stats_poll_interval; return
  end
- if cfg.stats_farm_only and not is_inside_farm() then
+ if cfg.stats_home_only and not is_inside_home() then
   earnings.last_money,earnings.candidate_money,earnings.candidate_count=nil,nil,0; earnings.context_since=now; earnings.next_poll=now+S.stats_poll_interval; return
  end
  if now<earnings.next_poll then return end; earnings.next_poll=now+S.stats_poll_interval
@@ -372,61 +389,58 @@ local function tick_keys(now)
  if #keys>0 and now>=keys[1].at then local v=table.remove(keys,1); set_key(v.key,v.down) end
 end
 
+local function restore_collision()
+ for ped in pairs(collision.changed) do pcall(setCharCollision,ped,true) end
+ collision.changed={}; collision.active=false
+end
+local function refresh_collision(now)
+ if not collision.active or not cfg.collision_bypass or now<collision.next_refresh then return end
+ collision.next_refresh=now+S.collision_refresh
+ local ok,peds=pcall(getAllChars); if not ok or type(peds)~='table' then return end
+ for _,ped in ipairs(peds) do
+  if ped~=PLAYER_PED then
+   local eok,exists=pcall(doesCharExist,ped)
+   if eok and exists and pcall(setCharCollision,ped,false) then collision.changed[ped]=true end
+  end
+ end
+end
+
 local function phase(name,now,msg)
  if flow.phase~=name then log('workflow '..flow.phase..' -> '..name) end
- flow.phase,flow.since,flow.due=name,now,nil
+ flow.phase,flow.since,flow.due,flow.retries=name,now,nil,0
  if msg then tell(msg) end
 end
 local function clear_ui()
- ui.spawn_scheduled=false; ui.spawn_pending_at=nil
+ ui.spawn_scheduled,ui.inventory,ui.locker,ui.promo_due=false,false,false,nil
  flow.spawned,flow.spawn_at=false,nil
 end
 local function default_destination()
- flow.desired='farm'
+ flow.desired=(not cfg.outfit_recovery or cfg.last_uniform or flow.outfit_abandoned) and 'home' or 'fbi'
 end
 
-local function farm_index_from_spawn_list(message)
- if not message or not message:find('event.auth.initializeSpawnPoints',1,true) then return nil end
- local count=0
- for label in message:gmatch('"spawn"%s*:%s*"([^"\\]*)"') do
-  count=count+1
-  local lower=label:lower()
-  if lower=='farm' or lower:match('^farm[%s%p]') or lower:find('ферм',1,true) or lower:find('Ферм',1,true) then
-   return count
-  end
- end
- return nil
-end
-
-local function has_last_exit_option(message)
- if not message then return false end
- local lower=message:lower()
- return (lower:find('last',1,true) and lower:find('exit',1,true)) or
-  (message:find('последн',1,true) and message:find('выход',1,true)) or
-  (message:find('Последн',1,true) and message:find('выход',1,true))
-end
-
-local function choose_farm_index(message)
- if cfg.farm_spawn_index_mode~=0 then return cfg.farm_spawn_index_mode,'manual override',true end
- local index=farm_index_from_spawn_list(message)
- if index and index<=12 then return index,'spawn list name',true end
- if has_last_exit_option(message) then return 6,'last-exit option',true end
- if flow.next_spawn_index then return flow.next_spawn_index,'alternate after wrong spawn',false end
- return FARM_DEFAULT_INDEX,'fallback; list unavailable',false
-end
-
-local function schedule_spawn(now,message)
+local function schedule_spawn(now)
  if ui.spawn_scheduled or sampIsLocalPlayerSpawned() or not cfg.enabled then return end
- ui.spawn_scheduled=true; ui.spawn_pending_at=nil
- local index,source,confirmed=choose_farm_index(message)
- flow.spawn_index,flow.spawn_index_source,flow.spawn_confirmed=index,source,confirmed
- flow.next_spawn_index=nil
- flow.farm_spawn_requested=true
+ ui.spawn_scheduled=true
+ local index=flow.desired=='home' and HOME_SPAWN_INDEX or FBI_SPAWN_INDEX
  local at=now+S.spawn_screen_delay
  for _=1,8 do pulse(VK_UP,at,.16); at=at+S.key_step end
  for _=2,index do pulse(VK_DOWN,at,.16); at=at+S.key_step end
  pulse(VK_RETURN,at,.20)
- phase('WAIT_SPAWN',now,string.format('Selecting Farm spawn (menu item %d; %s).',index,source))
+ phase('WAIT_SPAWN',now,string.format('Selecting %s spawn (menu item %d).',
+  flow.desired=='home' and 'house #1577' or 'FBI organization',index))
+end
+
+local function send_cef(payload)
+ local bs
+ local ok,e=pcall(function()
+  bs=raknetNewBitStream()
+  raknetBitStreamWriteInt8(bs,220); raknetBitStreamWriteInt8(bs,18)
+  raknetBitStreamWriteInt16(bs,#payload); raknetBitStreamWriteString(bs,payload); raknetBitStreamWriteInt32(bs,0)
+  raknetSendBitStreamEx(bs,2,9,6)
+ end)
+ if bs then pcall(raknetDeleteBitStream,bs) end
+ if not ok then log('CEF send error: '..tostring(e)); return false end
+ log('CEF sent: '..payload); return true
 end
 
 local function read_arizona(bs,sub)
@@ -449,79 +463,259 @@ local function read_arizona(bs,sub)
  if ok then return result end; log('CEF packet read error: '..tostring(result)); return nil
 end
 
-is_inside_farm=function()
- if not cfg.farm_calibrated or getCharActiveInterior(PLAYER_PED)~=cfg.farm_interior then return false end
+local function dist(x,y,a,b) local dx,dy=a-x,b-y; return math.sqrt(dx*dx+dy*dy) end
+is_inside_home=function()
+ if getCharActiveInterior(PLAYER_PED)~=HOME_INTERIOR then return false end
  local x,y,z=getCharCoordinates(PLAYER_PED)
- local dx,dy,dz=x-cfg.farm_x,y-cfg.farm_y,z-cfg.farm_z
- return dx*dx+dy*dy+dz*dz<=cfg.farm_radius*cfg.farm_radius
+ return dist(x,y,HOME_X,HOME_Y)<=HOME_RADIUS and math.abs(z-HOME_Z)<=5
 end
-local function reconnect_to_farm(now,reason)
- if flow.farm_relog_attempts>=2 then
-  release_keys(); flow.farm_retry_at=now+S.farm_watch_interval
-  phase('WAIT_FARM_RETRY',now,string.format('Farm was not reached after two relogs. Retrying in %d minutes; check spawn list and calibration.',math.floor(S.farm_watch_interval/60)))
-  return
+local function nearby_guard()
+ local px,py,pz=getCharCoordinates(PLAYER_PED)
+ local ok,peds=pcall(getAllChars); if not ok or type(peds)~='table' then return nil end
+ for _,ped in ipairs(peds) do
+  if ped~=PLAYER_PED then
+   local eok,exists=pcall(doesCharExist,ped)
+   local pok,is_player=pcall(sampGetPlayerIdByCharHandle,ped)
+   if eok and exists and pok and not is_player then
+    local cok,x,y,z=pcall(getCharCoordinates,ped)
+    local iok,interior=pcall(getCharActiveInterior,ped)
+    if cok and iok and interior==HOME_INTERIOR and dist(px,py,x,y)<=S.guard_scan_radius
+       and math.abs(pz-z)<=4 then
+     local mok,model=pcall(getCharModel,ped)
+     return ped,mok and model or -1
+    end
+   end
+  end
  end
- flow.farm_relog_attempts=flow.farm_relog_attempts+1
- if cfg.farm_spawn_index_mode==0 and flow.spawn_index and not flow.spawn_confirmed then
-  flow.next_spawn_index=flow.spawn_index==5 and 6 or 5
- end
- release_keys(); clear_ui(); flow.farm_spawn_requested=false; flow.desired='farm'
- phase('RECONNECTING_FARM',now,string.format('%s Relog to Farm (%d/2 before cooldown).',reason,flow.farm_relog_attempts))
- local ok,e=pcall(sampProcessChatInput,'/reconnect')
- if not ok then phase('FAILED',now,'Could not execute /reconnect: '..tostring(e)) end
+ return nil
 end
 
-local function farm_tick(now)
+local function begin_route(now)
+ flow.route_i,flow.route_at,flow.best,flow.progress_at,flow.acted=1,now,nil,now,nil
+ flow.locker_attempts=0
+ flow.outfit_attempts=flow.outfit_attempts+1
+ collision.active=cfg.collision_bypass; collision.next_refresh=0
+ phase('WALK_FBI',now,string.format('Uniform missing. Starting direct FBI route attempt %d/2; remote-player collision bypass is active.',flow.outfit_attempts))
+end
+
+local function relog(destination,now)
+ release_keys(); restore_collision(); flow.desired=destination; clear_ui()
+ phase('RECONNECTING_'..destination:upper(),now,destination=='home'
+  and 'Uniform confirmed. Reconnecting to house #1577.'
+  or 'Uniform is missing. Reconnecting to the FBI organization spawn.')
+ local ok,e=pcall(sampProcessChatInput,'/reconnect')
+ if not ok then fatal='Could not execute official /reconnect: '..tostring(e); cfg.enabled=false; tell(fatal,0xFF9090) end
+end
+
+local function outfit_failed(now,reason)
+ release_keys(); restore_collision()
+ if flow.outfit_attempts<2 then
+  tell(reason..' Reconnecting to FBI for the second and final attempt.',0xFFD280)
+  relog('fbi',now)
+ else
+  flow.outfit_abandoned=true
+  tell(reason..' Two attempts failed; abandoning the outfit cycle and returning home.',0xFF9090)
+  relog('home',now)
+ end
+end
+
+local finish_home
+
+local function inspect_spawn(now)
+ local model,interior=getCharModel(PLAYER_PED),getCharActiveInterior(PLAYER_PED)
+ cfg.last_model,cfg.last_uniform=model,model==FBI_MODEL; save_config()
+ if model==FBI_MODEL then flow.outfit_abandoned=false; flow.outfit_attempts=0 end
+ tell(string.format('Spawn checked: model=%d, interior=%d, uniform=%s.',model,interior,cfg.last_uniform and 'YES' or 'NO'))
+ if interior==FBI_INTERIOR then
+  if model==FBI_MODEL then relog('home',now)
+  elseif cfg.outfit_recovery then begin_route(now)
+  else flow.outfit_abandoned=true; tell('Outfit recovery is disabled; returning home.',0xFFD280); relog('home',now) end
+ elseif interior==HOME_INTERIOR and is_inside_home() then
+  flow.guard_attempts,flow.guard_started_at=0,now
+  if model~=FBI_MODEL and not cfg.outfit_recovery then flow.outfit_abandoned=true end
+  if not cfg.guard_recovery then
+   finish_home(now,'Guard recovery is disabled. Character remains inside house #1577.')
+  elseif cfg.guard_abandoned then
+   finish_home(now,'Guard automation was previously abandoned after repeated failures. Character remains inside house #1577; use /phrec run for a new guarded attempt.')
+  elseif model==FBI_MODEL then phase('GUARD_OPEN',now,'At house #1577 in FBI uniform. Checking the personal guard.'); flow.due=now+(cfg.guard_active and 3 or 1.5)
+  elseif flow.outfit_abandoned then
+   phase('GUARD_OPEN',now,'At house #1577 after two failed outfit attempts. Checking the personal guard.'); flow.due=now+(cfg.guard_active and 3 or 1.5)
+  else relog('fbi',now) end
+ elseif model==FBI_MODEL then relog('home',now) else relog('fbi',now) end
+end
+
+local function route_tick(now)
+ if getCharActiveInterior(PLAYER_PED)~=FBI_INTERIOR then
+  outfit_failed(now,'FBI route stopped because the character left interior 187.'); return
+ end
+ if now-flow.route_at>S.route_timeout then
+  outfit_failed(now,'FBI route did not reach the locker within 65 seconds.'); return
+ end
+ refresh_collision(now)
+ if ui.promo_due and now>=ui.promo_due then
+  ui.promo_due=nil; set_key(VK_W,false); pulse(VK_ESCAPE,now,.20); flow.due=now+.8; return
+ end
+ if flow.due and now<flow.due then set_key(VK_W,false); return end
+ flow.due=nil
+ local node=ROUTE[flow.route_i]
+ if not node then
+  release_keys(); restore_collision(); phase('WAIT_LOCKER',now,'Locker action sent; waiting for launcher menu.'); flow.due=now+1; return
+ end
+ local x,y=getCharCoordinates(PLAYER_PED); local d=dist(x,y,node.x,node.y)
+ if not flow.best or d<flow.best-.15 then flow.best,flow.progress_at=d,now
+ elseif now-flow.progress_at>=S.route_stall then
+  set_key(VK_W,false); flow.progress_at,flow.best=now,d
+  if flow.route_i==2 or flow.route_i==8 then
+   pulse(VK_H,now,.35); flow.due=now+2
+   tell(string.format('Door passage is still blocked at node %d; pressing H again.',flow.route_i),0xFFD280)
+  else
+   pulse(VK_SPACE,now,.20); flow.due=now+.7
+   tell(string.format('Route recovery at node %d (%.1fm).',flow.route_i,d),0xFFD280)
+  end
+  return
+ end
+ if d<=node.t then
+  set_key(VK_W,false)
+  if node.a=='door' and flow.acted~=flow.route_i then
+   flow.acted=flow.route_i
+   tell(string.format('At FBI door %d: stopped %.2fm before the calibrated point; pressing H.',
+    flow.route_i==1 and 1 or 2,d))
+   pulse(VK_H,now,.35); flow.due=now+2.0
+  elseif node.a=='locker' and flow.acted~=flow.route_i then
+   flow.acted=flow.route_i; pulse(VK_MENU,now,.25); flow.due=now+1
+  else
+   flow.route_i=flow.route_i+1; flow.best,flow.progress_at,flow.acted=nil,now,nil
+  end
+  return
+ end
+ setCharHeading(PLAYER_PED,getHeadingFromVector2d(node.x-x,node.y-y))
+ set_key(VK_W,true)
+end
+
+local function locker_tick(now)
+ if getCharModel(PLAYER_PED)==FBI_MODEL then
+  cfg.last_uniform,cfg.last_model=true,FBI_MODEL
+  flow.outfit_abandoned,flow.outfit_attempts=false,0
+  save_config(); relog('home',now); return
+ end
+ if flow.due and now>=flow.due then
+ flow.due=nil
+  if send_cef('mountain.testDrive.selectVehicle|0') then
+   flow.locker_attempts=flow.locker_attempts+1
+   phase('WAIT_DRESS',now,'Requested the first locker item: change clothes.')
+  end
+ elseif now-flow.since>S.locker_timeout then
+  if flow.locker_attempts>=3 then outfit_failed(now,'Locker did not change the model to 286.')
+  else pulse(VK_MENU,now,.25); flow.due=now+1.2; flow.since=now end
+ end
+end
+
+finish_home=function(now,message)
+ local model=getCharModel(PLAYER_PED)
+ if not is_inside_home() then relog(model==FBI_MODEL and 'home' or 'fbi',now); return end
+ if model~=FBI_MODEL and not flow.outfit_abandoned then relog('fbi',now); return end
+ flow.home_check_at=now+S.home_watch_interval
+ phase('DONE',now,message)
+end
+
+local function abandon_guard(now,reason)
+ cfg.guard_active,cfg.guard_abandoned=false,true; save_config()
+ release_keys(); ui.inventory=false; flow.guard_started_at=nil
+ finish_home(now,string.format('%s Guard automation is abandoned after %d attempt(s) until /phrec run; character remains inside house #1577.',reason,flow.guard_attempts))
+end
+
+local function retry_or_abandon_guard(now,reason)
+ cfg.guard_active=false; save_config()
+ if flow.guard_attempts<2 then
+  phase('GUARD_OPEN',now,reason..' Retrying the guard once more.'); flow.due=now+2
+ else abandon_guard(now,reason) end
+end
+
+local function guard_tick(now)
+ if not cfg.guard_recovery then
+  release_keys(); flow.guard_started_at=nil
+  finish_home(now,'Guard recovery was disabled from the control panel. Character remains inside house #1577.'); return
+ end
+ if flow.guard_started_at and now-flow.guard_started_at>S.guard_cycle_timeout then
+  abandon_guard(now,'The complete guard cycle exceeded 40 seconds.'); return
+ end
+ if flow.phase=='GUARD_OPEN' and flow.due and now>=flow.due then
+  flow.due=nil
+  local ped,model=nearby_guard()
+  if ped then
+   cfg.guard_active,cfg.guard_abandoned=true,false; save_config()
+   finish_home(now,string.format('Guard already exists nearby (ped=%d, model=%d); summon menu was skipped.',ped,model))
+  else
+   flow.guard_attempts=flow.guard_attempts+1
+   pulse(VK_I,now,.25); phase('GUARD_INVENTORY',now,string.format('Opening guard inventory attempt %d/2.',flow.guard_attempts)); flow.due=now+1.5
+  end
+ elseif flow.phase=='GUARD_INVENTORY' and flow.due and now>=flow.due then
+  flow.due=nil
+  if send_cef('requestShowingInventory|28') then phase('GUARD_SELECT',now); flow.due=now+.8
+  else retry_or_abandon_guard(now,'Could not open the guard inventory interface.') end
+ elseif flow.phase=='GUARD_SELECT' and flow.due and now>=flow.due then
+  flow.due=nil
+  if send_cef('selectSecurity|{"id":'..GUARD_ID..'}') then phase('GUARD_MENU',now); flow.due=now+1
+  else retry_or_abandon_guard(now,'Could not select the guard item.') end
+ elseif flow.phase=='GUARD_MENU' and flow.due and now>=flow.due then
+  flow.due=nil
+  if send_cef('clickOnMenu|{"id": '..GUARD_ID..'}') then phase('GUARD_CONFIRM',now); flow.due=now+1
+  else retry_or_abandon_guard(now,'Could not open the guard action menu.') end
+ elseif flow.phase=='GUARD_CONFIRM' and flow.due and now>=flow.due then
+  flow.due=nil; pulse(VK_HOME,now,.18); pulse(VK_RETURN,now+.32,.20)
+  phase('GUARD_WAIT',now,'Guard toggle requested; waiting for the NPC to appear.'); flow.due=now+5
+ elseif flow.phase=='GUARD_WAIT' and flow.due and now>=flow.due then
+  flow.due=nil
+  local ped,model=nearby_guard()
+  if ped then
+   cfg.guard_active,cfg.guard_abandoned=true,false; save_config()
+   finish_home(now,string.format('Guard verified nearby (ped=%d, model=%d). Character remains inside house #1577.',ped,model))
+  else retry_or_abandon_guard(now,'Guard was not found after the toggle.') end
+ elseif now-flow.since>S.guard_timeout then abandon_guard(now,'The current guard interface step timed out.') end
+end
+
+local function flow_tick(now,state)
+ tick_keys(now)
+ if not cfg.enabled or state~=sf.GAMESTATE_CONNECTED then return end
+ if not cfg.outfit_recovery and (flow.phase=='WALK_FBI' or flow.phase=='WAIT_LOCKER' or flow.phase=='WAIT_DRESS') then
+  flow.outfit_abandoned=true; release_keys(); restore_collision()
+  tell('Outfit recovery was disabled from the control panel; returning home.',0xFFD280); relog('home',now); return
+ end
  if not sampIsLocalPlayerSpawned() then
   if flow.phase=='DONE' then
-   clear_ui(); flow.farm_spawn_requested=false
-   phase('WAIT_LOGIN',now,'Character disappeared; waiting to restore Farm spawn.')
-  elseif flow.phase=='WAIT_SPAWN' and now-flow.since>S.spawn_timeout then
-   release_keys(); phase('FAILED',now,'Farm spawn selection timed out. Check for a login code or changed menu.')
+   default_destination(); clear_ui(); phase('WAIT_LOGIN',now,'Character disappeared; waiting to restore the home AFK state.')
+  end
+  if flow.phase=='WAIT_SPAWN' and now-flow.since>S.spawn_timeout then
+   release_keys(); phase('FAILED',now,'Spawn selection timed out. Check for a verification code or changed interface.')
   end
   return
  end
  if not flow.spawned then
   temporary_password_lock,password_retry_due=false,nil
   flow.spawned,flow.spawn_at=true,now; release_keys(); ui.spawn_scheduled=false
-  phase('SPAWN_SETTLE',now,'Character appeared; checking Farm position.'); return
+  phase('SPAWN_SETTLE',now,'Character appeared; checking location and FBI uniform.'); return
  end
- if flow.phase=='SPAWN_SETTLE' and now-flow.spawn_at>=S.spawn_settle then
-  if not cfg.farm_calibrated and flow.farm_spawn_requested and flow.spawn_confirmed then
+ if flow.phase=='SPAWN_SETTLE' and now-flow.spawn_at>=S.spawn_settle then inspect_spawn(now)
+ elseif flow.phase=='WALK_FBI' then route_tick(now)
+ elseif flow.phase=='WAIT_LOCKER' or flow.phase=='WAIT_DRESS' then locker_tick(now)
+ elseif flow.phase:find('^GUARD_') then guard_tick(now)
+ elseif flow.phase=='DONE' and cfg.home_protection and now>=flow.home_check_at then
+  flow.home_check_at=now+S.home_watch_interval
+  local model,interior=getCharModel(PLAYER_PED),getCharActiveInterior(PLAYER_PED)
+  if interior~=HOME_INTERIOR or not is_inside_home() then
    local x,y,z=getCharCoordinates(PLAYER_PED)
-   cfg.farm_x,cfg.farm_y,cfg.farm_z=x,y,z
-   cfg.farm_interior=getCharActiveInterior(PLAYER_PED); cfg.farm_calibrated=true; save_config()
-   tell(string.format('Farm spawn #%d recorded at %.1f / %.1f / %.1f, interior %d. Confirm on screen that this is Farm.',flow.spawn_index,x,y,z,cfg.farm_interior),0xFFD280)
+   tell(string.format('AFK protection: character is outside the calibrated house zone (interior=%d, %.1f/%.1f/%.1f).',interior,x,y,z),0xFFD280)
+   relog(model==FBI_MODEL and 'home' or 'fbi',now)
+  elseif model~=FBI_MODEL and not flow.outfit_abandoned then
+   cfg.last_uniform,cfg.last_model=false,model; save_config()
+   tell(string.format('AFK protection: FBI model 286 was lost (current %d).',model),0xFFD280)
+   relog('fbi',now)
   end
-  if not cfg.farm_calibrated and flow.farm_spawn_requested and not flow.spawn_confirmed then
-   flow.farm_spawn_requested=false; flow.farm_retry_at=now+S.farm_watch_interval
-   phase('WAIT_FARM_CALIBRATION',now,'Spawn list did not identify Farm. Check location and use /phfarm calibrate; automatic calibration is paused.'); return
-  end
-  if is_inside_farm() then
-   flow.farm_relog_attempts=0; flow.farm_spawn_requested=false; flow.farm_retry_at=nil; flow.farm_check_at=now+S.farm_watch_interval
-   phase('DONE',now,'Recorded Farm zone reached. Character is standing AFK.'); return
-  end
-  reconnect_to_farm(now,'Character is outside the recorded Farm spawn.'); return
  end
- if flow.phase=='WAIT_FARM_RETRY' and flow.farm_retry_at and now>=flow.farm_retry_at then
-  flow.farm_relog_attempts=0; flow.farm_retry_at=nil
-  reconnect_to_farm(now,'Scheduled Farm recovery retry.'); return
- end
- if flow.phase=='DONE' and cfg.farm_protection and now>=flow.farm_check_at then
-  flow.farm_check_at=now+S.farm_watch_interval
-  if not is_inside_farm() then reconnect_to_farm(now,'Character left the Farm spawn zone.') end
- end
-end
-
-local function flow_tick(now,state)
- tick_keys(now)
- if not cfg.enabled or state~=sf.GAMESTATE_CONNECTED then return end
- if ui.spawn_pending_at and now>=ui.spawn_pending_at then schedule_spawn(now) end
- farm_tick(now)
 end
 
 local function reset_connection(now)
- release_keys(); clear_ui(); flow.farm_spawn_requested=false; flow.since=now
+ release_keys(); restore_collision(); clear_ui(); flow.since=now
  earnings.last_money,earnings.candidate_money,earnings.candidate_count=nil,nil,0; earnings.context_since=now; earnings.next_poll=now+3
  if not flow.desired then default_destination() end
  flow.phase='WAIT_LOGIN'
@@ -569,7 +763,7 @@ local function reconnect_tick(now,state)
   local name=(sampGetCurrentServerName() or ''):gsub('{%x%x%x%x%x%x}',''):lower()
   if not name:find('phoenix',1,true) then return end
   if not target and valid_address(ip,port) then target={ip=ip,port=port} end
-  if target and not announced then tell('Phoenix detected. Farm spawn and reconnect automation is ready.'); announced=true end
+  if target and not announced then tell('Phoenix detected. FBI uniform, guard and reconnect automation is ready.'); announced=true end
   deadline,queued=nil,false; connected_since=connected_since or now
   if sampIsLocalPlayerSpawned() then temporary_password_lock,password_retry_due=false,nil end
   if now-connected_since>=S.stable_reset then attempts=0 end
@@ -600,86 +794,60 @@ local function state_name(state)
 end
 
 local function status()
- tell(string.format('%s | state=%s | workflow=%s | destination=Farm (auto 5/6) | last-menu=%s | calibrated=%s | relog=%d/2 | restart-lock=%s | transport-close=%s',
-  cfg.enabled and 'ON' or 'OFF',state_name(last_state),flow.phase,
-  tostring(flow.spawn_index or '?'),
-  cfg.farm_calibrated and 'YES' or 'NO',flow.farm_relog_attempts,
-  temporary_password_lock and 'WAITING' or 'NO',transport_closed and 'WAITING' or 'NO'))
+ tell(string.format('%s | state=%s | workflow=%s | destination=%s | model=%s | outfit=%d/2%s | guard=%s | collision=%s | restart-lock=%s | transport-close=%s',
+  cfg.enabled and 'ON' or 'OFF',state_name(last_state),flow.phase,tostring(flow.desired or 'auto'),
+  tostring(cfg.last_model),flow.outfit_attempts,flow.outfit_abandoned and '-ABANDONED' or '',
+  cfg.guard_abandoned and 'ABANDONED' or (cfg.guard_active and 'ACTIVE' or 'CHECK'),
+  cfg.collision_bypass and 'ON' or 'OFF',temporary_password_lock and 'WAITING' or 'NO',transport_closed and 'WAITING' or 'NO'))
  if blocked then tell('Stopped: '..blocked) end
- local next_due=transport_retry_due or password_retry_due or deadline or flow.farm_retry_at
+ local next_due=transport_retry_due or password_retry_due or deadline
  if next_due then tell('Next reconnect check in '..math.ceil(math.max(0,next_due-clock()))..'s.') end
- tell(string.format('Features: reconnect=%s Farm-protection=%s wallet=%s Farm-only=%s',
-  cfg.reconnect_enabled and 'ON' or 'OFF',cfg.farm_protection and 'ON' or 'OFF',
-  cfg.stats_enabled and 'ON' or 'OFF',cfg.stats_farm_only and 'ON' or 'OFF'))
+ tell(string.format('Features: reconnect=%s outfit=%s guard=%s home-protection=%s collision=%s',
+  cfg.reconnect_enabled and 'ON' or 'OFF',cfg.outfit_recovery and 'ON' or 'OFF',
+  cfg.guard_recovery and 'ON' or 'OFF',cfg.home_protection and 'ON' or 'OFF',cfg.collision_bypass and 'ON' or 'OFF'))
 end
 
 local function feature(field,value,label)
- cfg[field]=value
+ cfg[field]=value; if field=='collision_bypass' and not value then restore_collision() end
+ if field=='outfit_recovery' then default_destination() end
  save_config(); if sync_gui then sync_gui() end
  tell(label..' is '..(value and 'ON.' or 'OFF.'))
 end
 
 local function command(args)
  args=trim(args):lower()
- if args=='off' then cfg.enabled,deadline=false,nil; transport_closed,transport_retry_due=false,nil; release_keys(); save_config(); if sync_gui then sync_gui() end; tell('Automation is OFF.')
+ if args=='off' then cfg.enabled,deadline=false,nil; transport_closed,transport_retry_due=false,nil; release_keys(); restore_collision(); save_config(); if sync_gui then sync_gui() end; tell('Automation is OFF.')
  elseif args=='on' then cfg.enabled,blocked,deadline,fatal=true,nil,nil,nil; transport_closed,transport_retry_due=false,nil; attempts=0; save_config(); if sync_gui then sync_gui() end; tell('Automation is ON.')
  elseif args=='run' or args=='retry' then
-  cfg.enabled,blocked,fatal=true,nil,nil; release_keys(); clear_ui()
-  flow.farm_relog_attempts=0; flow.farm_spawn_requested=false; flow.farm_retry_at=nil
+  cfg.enabled,blocked,fatal=true,nil,nil; release_keys(); restore_collision(); clear_ui()
+  cfg.guard_abandoned=false
+  flow.outfit_attempts,flow.outfit_abandoned,flow.guard_attempts,flow.guard_started_at=0,false,0,nil
   if sampIsLocalPlayerSpawned() then flow.spawned,flow.spawn_at=true,clock(); phase('SPAWN_SETTLE',clock(),'Manual workflow retry started.')
   else default_destination(); phase('WAIT_LOGIN',clock(),'Waiting for login screen.') end
   save_config(); if sync_gui then sync_gui() end
  elseif args=='reconnect on' then feature('reconnect_enabled',true,'Network reconnect')
  elseif args=='reconnect off' then feature('reconnect_enabled',false,'Network reconnect')
- elseif args=='farm on' then feature('farm_protection',true,'Farm position protection')
- elseif args=='farm off' then feature('farm_protection',false,'Farm position protection')
+ elseif args=='outfit on' then feature('outfit_recovery',true,'Outfit recovery')
+ elseif args=='outfit off' then feature('outfit_recovery',false,'Outfit recovery')
+ elseif args=='guard on' then feature('guard_recovery',true,'Guard recovery')
+ elseif args=='guard off' then feature('guard_recovery',false,'Guard recovery')
+ elseif args=='home on' then feature('home_protection',true,'Home protection')
+ elseif args=='home off' then feature('home_protection',false,'Home protection')
  elseif args=='stats on' then feature('stats_enabled',true,'Earnings tracking')
  elseif args=='stats off' then feature('stats_enabled',false,'Earnings tracking'); reset_money_baseline()
- else status(); tell('Commands: /phrec on/off/run/status | reconnect/farm/stats on/off | /phfarm | /phmenu') end
+ elseif args=='collision on' then feature('collision_bypass',true,'Remote-player collision bypass')
+ elseif args=='collision off' then feature('collision_bypass',false,'Remote-player collision bypass')
+ else status(); tell('Commands: /phrec on/off/run/status | reconnect/outfit/guard/home/stats/collision on/off | /phmenu') end
 end
 
 local function stats_command(args)
  args=trim(args):lower()
  if args=='on' then feature('stats_enabled',true,'Earnings tracking'); reset_money_baseline()
  elseif args=='off' then feature('stats_enabled',false,'Earnings tracking'); reset_money_baseline()
- elseif args=='farm' then cfg.stats_farm_only=true; reset_money_baseline(); save_config(); if sync_gui then sync_gui() end; tell('Earnings tracking is limited to the Farm spawn zone.')
- elseif args=='all' then cfg.stats_farm_only=false; reset_money_baseline(); save_config(); if sync_gui then sync_gui() end; tell('Earnings tracking now includes every location.')
+ elseif args=='home' then cfg.stats_home_only=true; reset_money_baseline(); save_config(); if sync_gui then sync_gui() end; tell('Earnings tracking is limited to house #1577.')
+ elseif args=='all' then cfg.stats_home_only=false; reset_money_baseline(); save_config(); if sync_gui then sync_gui() end; tell('Earnings tracking now includes every location.')
  elseif args=='baseline' then reset_money_baseline(); tell('Wallet baseline will be captured again without counting a change.')
  else show_stats() end
-end
-
-local function farm_command(args)
- args=trim(args):lower()
- if args=='calibrate' then
-  if not sampIsLocalPlayerSpawned() then tell('Spawn at Farm before calibration.',0xFFD280); return end
-  local x,y,z=getCharCoordinates(PLAYER_PED)
-  cfg.farm_x,cfg.farm_y,cfg.farm_z=x,y,z; cfg.farm_interior=getCharActiveInterior(PLAYER_PED)
-  cfg.farm_calibrated=true; flow.farm_relog_attempts=0; flow.farm_retry_at=nil
-  flow.farm_check_at=clock()+S.farm_watch_interval; phase('DONE',clock()); save_config(); reset_money_baseline()
-  tell(string.format('Farm position saved: %.1f / %.1f / %.1f, interior %d.',x,y,z,cfg.farm_interior))
- elseif args=='forget' then cfg.farm_calibrated=false; save_config(); reset_money_baseline(); tell('Farm position forgotten; next selected Farm spawn will be recorded.')
- elseif args=='index auto' then
-  cfg.farm_spawn_index_mode=0; save_config(); tell('Farm spawn menu selection: automatic by name, then 5/6 fallback.')
- elseif args=='index 5' or args=='index 6' then
-  cfg.farm_spawn_index_mode=tonumber(args:match('%d+')); save_config()
-  tell('Farm spawn menu item forced to #'..cfg.farm_spawn_index_mode..'. Use /phfarm index auto to restore automatic selection.')
- elseif args:match('^radius %d+$') then
-  cfg.farm_radius=clamp(args:match('%d+'),5,100,cfg.farm_radius)
-  save_config(); if sync_gui then sync_gui() end; reset_money_baseline()
-  tell('Farm radius set to '..cfg.farm_radius..' game units.')
- elseif args:match('^interval %d+$') then
-  S.farm_watch_interval=clamp(tonumber(args:match('%d+'))*60,300,14400,S.farm_watch_interval)
-  flow.farm_check_at=clock()+S.farm_watch_interval
-  if flow.farm_retry_at then flow.farm_retry_at=clock()+S.farm_watch_interval end
-  save_config(); if sync_gui then sync_gui() end
-  tell('Farm position check every '..math.floor(S.farm_watch_interval/60)..' minutes.')
- else
-  tell(string.format('Farm menu=%s | last-selected=%s (%s) | calibrated=%s | center=%.1f / %.1f / %.1f | interior=%d | radius=%d | check=%d min',
-   cfg.farm_spawn_index_mode==0 and 'auto 5/6' or tostring(cfg.farm_spawn_index_mode),
-   tostring(flow.spawn_index or '?'),tostring(flow.spawn_index_source or '?'),
-   cfg.farm_calibrated and 'YES' or 'NO',cfg.farm_x,cfg.farm_y,cfg.farm_z,cfg.farm_interior,cfg.farm_radius,math.floor(S.farm_watch_interval/60)))
-  tell('Commands: /phfarm calibrate | forget | radius 15 | interval 30 | status')
- end
 end
 
 local function update_command(args)
@@ -706,30 +874,33 @@ local function setup_gui()
  local new=imgui.new
  local ffi=require 'ffi'
  gui_open=new.bool(false)
- gui_values={enabled=new.bool(false),reconnect=new.bool(false),farm=new.bool(false),
-  stats=new.bool(false),stats_farm=new.bool(false),update=new.bool(false),update_url=new.char[512](),
-  retry=new.int(30),max_retry=new.int(300),restart=new.int(120),wait_connect=new.int(45),join=new.int(180),
-  farm_minutes=new.int(30),farm_radius=new.int(15)}
+ gui_values={enabled=new.bool(false),reconnect=new.bool(false),outfit=new.bool(false),guard=new.bool(false),home=new.bool(false),collision=new.bool(false),
+  stats=new.bool(false),stats_home=new.bool(false),update=new.bool(false),update_url=new.char[512](),
+  retry=new.int(30),max_retry=new.int(300),restart=new.int(120),wait_connect=new.int(45),join=new.int(180),route=new.int(65),guard_step=new.int(20),guard_cycle=new.int(40)}
  local function set_url_buffer(value)
   value=tostring(value or ''); ffi.fill(gui_values.update_url,512,0); ffi.copy(gui_values.update_url,value,math.min(#value,511))
  end
  sync_gui=function()
   gui_values.enabled[0]=cfg.enabled; gui_values.reconnect[0]=cfg.reconnect_enabled
-  gui_values.farm[0]=cfg.farm_protection
-  gui_values.stats[0]=cfg.stats_enabled; gui_values.stats_farm[0]=cfg.stats_farm_only; gui_values.update[0]=cfg.update_enabled
+  gui_values.outfit[0]=cfg.outfit_recovery; gui_values.guard[0]=cfg.guard_recovery
+  gui_values.home[0]=cfg.home_protection; gui_values.collision[0]=cfg.collision_bypass
+  gui_values.stats[0]=cfg.stats_enabled; gui_values.stats_home[0]=cfg.stats_home_only; gui_values.update[0]=cfg.update_enabled
   gui_values.retry[0]=S.retry_delay; gui_values.max_retry[0]=S.max_retry_delay
   gui_values.restart[0]=S.restart_grace; gui_values.wait_connect[0]=S.wait_connect_grace
-  gui_values.join[0]=S.join_timeout
-  gui_values.farm_minutes[0]=math.floor(S.farm_watch_interval/60); gui_values.farm_radius[0]=cfg.farm_radius
+  gui_values.join[0]=S.join_timeout; gui_values.route[0]=S.route_timeout
+  gui_values.guard_step[0]=S.guard_timeout; gui_values.guard_cycle[0]=S.guard_cycle_timeout
   set_url_buffer(cfg.update_manifest_url)
  end
  sync_gui()
  local function apply_toggles()
   if cfg.enabled~=gui_values.enabled[0] then command(gui_values.enabled[0] and 'on' or 'off') end
-  local stats_changed=cfg.stats_enabled~=gui_values.stats[0] or cfg.stats_farm_only~=gui_values.stats_farm[0]
-  cfg.reconnect_enabled=gui_values.reconnect[0]; cfg.farm_protection=gui_values.farm[0]
-  cfg.stats_enabled=gui_values.stats[0]; cfg.stats_farm_only=gui_values.stats_farm[0]; cfg.update_enabled=gui_values.update[0]
-  if stats_changed then reset_money_baseline() end; save_config()
+  local outfit_changed=cfg.outfit_recovery~=gui_values.outfit[0]
+  local stats_changed=cfg.stats_enabled~=gui_values.stats[0] or cfg.stats_home_only~=gui_values.stats_home[0]
+  cfg.reconnect_enabled=gui_values.reconnect[0]; cfg.outfit_recovery=gui_values.outfit[0]
+  cfg.guard_recovery=gui_values.guard[0]; cfg.home_protection=gui_values.home[0]
+  cfg.stats_enabled=gui_values.stats[0]; cfg.stats_home_only=gui_values.stats_home[0]; cfg.update_enabled=gui_values.update[0]
+  if cfg.collision_bypass~=gui_values.collision[0] and not gui_values.collision[0] then restore_collision() end
+  cfg.collision_bypass=gui_values.collision[0]; if outfit_changed then default_destination() end; if stats_changed then reset_money_baseline() end; save_config()
  end
  local function apply_timings()
   S.retry_delay=clamp(gui_values.retry[0],15,300,30)
@@ -737,30 +908,29 @@ local function setup_gui()
   S.restart_grace=clamp(gui_values.restart[0],30,600,120)
   S.wait_connect_grace=clamp(gui_values.wait_connect[0],15,300,45)
   S.join_timeout=clamp(gui_values.join[0],30,600,180)
-  S.farm_watch_interval=clamp(gui_values.farm_minutes[0]*60,300,14400,1800)
-  cfg.farm_radius=clamp(gui_values.farm_radius[0],5,100,15)
-  flow.farm_check_at=clock()+S.farm_watch_interval
-  if flow.farm_retry_at then flow.farm_retry_at=clock()+S.farm_watch_interval end
+  S.route_timeout=clamp(gui_values.route[0],30,180,65)
+  S.guard_timeout=clamp(gui_values.guard_step[0],5,60,20)
+  S.guard_cycle_timeout=math.max(S.guard_timeout,clamp(gui_values.guard_cycle[0],15,120,40))
   save_config(); sync_gui(); tell('Control panel timings saved.')
  end
  gui_frame=imgui.OnFrame(function() return gui_open[0] end,function()
   local io=imgui.GetIO()
   imgui.SetNextWindowPos(imgui.ImVec2(io.DisplaySize.x/2,io.DisplaySize.y/2),imgui.Cond.FirstUseEver,imgui.ImVec2(.5,.5))
   imgui.SetNextWindowSize(imgui.ImVec2(620,720),imgui.Cond.FirstUseEver)
-  imgui.Begin('Phoenix Farm Guard 3.4.1',gui_open,imgui.WindowFlags.NoCollapse)
+  imgui.Begin('Phoenix FBI Guard 3.3.1',gui_open,imgui.WindowFlags.NoCollapse)
   imgui.Text('LIVE STATUS')
   imgui.Separator()
   imgui.Text('Connection state: '..state_name(last_state))
   imgui.Text('Workflow: '..tostring(flow.phase)..'   Destination: '..tostring(flow.desired or 'auto'))
   imgui.Text('Reconnect attempts: '..tostring(attempts)..'   Queue: '..(queued and 'YES' or 'NO'))
-  imgui.Text('Farm: menu auto 5/6   Last selected: '..tostring(flow.spawn_index or '?')..'   Calibration: '..(cfg.farm_calibrated and 'YES' or 'NO'))
-  imgui.Text(string.format('Farm center: %.1f / %.1f / %.1f   Interior: %d',cfg.farm_x,cfg.farm_y,cfg.farm_z,cfg.farm_interior))
+  imgui.Text('Model: '..tostring(cfg.last_model)..'   Uniform: '..(cfg.last_uniform and 'YES' or 'NO'))
+  imgui.Text('Guard: '..(cfg.guard_abandoned and 'ABANDONED' or (cfg.guard_active and 'ACTIVE' or 'CHECK')))
   if sampIsLocalPlayerSpawned() then
    local ok,x,y,z=pcall(getCharCoordinates,PLAYER_PED)
    local iok,interior=pcall(getCharActiveInterior,PLAYER_PED)
    if ok then imgui.Text(string.format('Position: %.1f / %.1f / %.1f   Interior: %s',x,y,z,iok and tostring(interior) or '?')) end
   end
-  local next_due=transport_retry_due or password_retry_due or deadline or flow.farm_retry_at
+  local next_due=transport_retry_due or password_retry_due or deadline
   imgui.Text('Next reconnect: '..(next_due and (tostring(math.ceil(math.max(0,next_due-clock())))..' sec') or 'none'))
   if blocked then imgui.TextWrapped('STOPPED: '..tostring(blocked)) end
   imgui.Separator()
@@ -768,9 +938,12 @@ local function setup_gui()
   local changed=false
   if imgui.Checkbox('Master automation',gui_values.enabled) then changed=true end
   if imgui.Checkbox('Recover network disconnects',gui_values.reconnect) then changed=true end
-  if imgui.Checkbox('Keep character at Farm spawn',gui_values.farm) then changed=true end
+  if imgui.Checkbox('Recover FBI outfit',gui_values.outfit) then changed=true end
+  if imgui.Checkbox('Summon and verify guard',gui_values.guard) then changed=true end
+  if imgui.Checkbox('Keep character inside house #1577',gui_values.home) then changed=true end
+  if imgui.Checkbox('Pass through remote players on FBI route',gui_values.collision) then changed=true end
   if imgui.Checkbox('Track wallet changes',gui_values.stats) then changed=true end
-  if imgui.Checkbox('Count earnings only near Farm spawn',gui_values.stats_farm) then changed=true end
+  if imgui.Checkbox('Count earnings only inside house #1577',gui_values.stats_home) then changed=true end
   if imgui.Checkbox('Install verified updates automatically',gui_values.update) then changed=true end
   if changed then apply_toggles() end
   imgui.Separator()
@@ -781,7 +954,6 @@ local function setup_gui()
   end
   imgui.Text('CSV: '..tostring(stats_path or 'not initialized'))
   if imgui.Button('Reset wallet baseline') then reset_money_baseline(); tell('Wallet baseline reset.') end
-  if imgui.Button('Calibrate current position as Farm') then farm_command('calibrate') end
   imgui.Separator()
   imgui.Text('TIMINGS (seconds)')
   imgui.InputInt('Base reconnect delay (15-300)',gui_values.retry)
@@ -789,16 +961,17 @@ local function setup_gui()
   imgui.InputInt('Restart grace (30-600)',gui_values.restart)
   imgui.InputInt('WAIT_CONNECT grace (15-300)',gui_values.wait_connect)
   imgui.InputInt('Join timeout (30-600)',gui_values.join)
-  imgui.InputInt('Farm position check, minutes (5-240)',gui_values.farm_minutes)
-  imgui.InputInt('Farm radius, game units (5-100)',gui_values.farm_radius)
+  imgui.InputInt('Outfit route timeout (30-180)',gui_values.route)
+  imgui.InputInt('Guard step timeout (5-60)',gui_values.guard_step)
+  imgui.InputInt('Complete guard timeout (15-120)',gui_values.guard_cycle)
   if imgui.Button('Save timings') then apply_timings() end
   imgui.SameLine()
   if imgui.Button('Restore timing defaults') then
    gui_values.retry[0],gui_values.max_retry[0],gui_values.restart[0],gui_values.wait_connect[0]=30,300,120,45
-   gui_values.join[0]=180; gui_values.farm_minutes[0]=30; gui_values.farm_radius[0]=15; apply_timings()
+   gui_values.join[0],gui_values.route[0],gui_values.guard_step[0],gui_values.guard_cycle[0]=180,65,20,40; apply_timings()
   end
   imgui.Separator()
-  if imgui.Button('Retry Farm recovery now') then command('run') end
+  if imgui.Button('Run recovery now and clear locks') then command('run') end
   imgui.SameLine()
   if imgui.Button('Emergency stop') then command('off') end
   imgui.Separator()
@@ -832,13 +1005,15 @@ function onReceivePacket(id,bs)
  if id==220 then
   local m=read_arizona(bs,17)
   if m then
-   if not sampIsLocalPlayerSpawned() then
-    if m:find('event.auth.initializeSpawnPoints',1,true) then
-     schedule_spawn(clock(),m)
-    elseif m:find('event.auth.updateVideoBackgroundVisible',1,true) and not ui.spawn_scheduled then
-     ui.spawn_pending_at=ui.spawn_pending_at or clock()+S.spawn_list_grace
-    end
+   if not sampIsLocalPlayerSpawned() and
+      (m:find('event.auth.initializeSpawnPoints',1,true) or m:find('event.auth.updateVideoBackgroundVisible',1,true)) then
+    schedule_spawn(clock())
    end
+   if m:find('event.inventory.setPlayerInventoryVisible',1,true) then ui.inventory=true end
+   if m:find('event.mountain.testDrive.addVehicles',1,true) then
+    ui.locker=true; if flow.phase=='WAIT_LOCKER' then flow.due=clock()+.25 end
+   end
+   if m:find('event.rewardBanner.initializeData',1,true) and flow.phase=='WALK_FBI' then ui.promo_due=clock()+.2 end
   end
   return
  end
@@ -849,19 +1024,19 @@ function onReceivePacket(id,bs)
    transport_closed=true
    transport_close_reason=id==sf.PACKET_DISCONNECTION_NOTIFICATION and 'server closed the connection' or 'connection was lost'
    transport_retry_due=now+retry_delay(); deadline=transport_retry_due; connected_since=nil; queued=false
-   release_keys(); clear_ui(); reset_connection(now)
+   release_keys(); restore_collision(); clear_ui(); reset_connection(now)
    tell(string.format('Detected: %s (packet %d). Official /reconnect will run in %ds.',transport_close_reason,id,math.ceil(transport_retry_due-now)),0xFFD280)
   end
  elseif id==sf.PACKET_CONNECTION_BANNED then
   transport_closed,transport_retry_due=false,nil
   blocked,deadline='Server reported a network/connection block. Check the launcher message.',nil
-  release_keys(); tell(blocked,0xFF9090)
+  release_keys(); restore_collision(); tell(blocked,0xFF9090)
  elseif id==sf.PACKET_INVALID_PASSWORD then
   -- Phoenix temporarily protects the server with a password while restart is
   -- still closed. This is a retryable state, not an account-password failure.
   transport_closed,transport_retry_due=false,nil
   temporary_password_lock,blocked=true,nil
-  release_keys()
+  release_keys(); restore_collision()
   password_retry_due=clock()+retry_delay(); deadline=password_retry_due
   tell('Server is temporarily password-locked during restart. Will keep retrying with backoff.',0xFFD280)
  elseif id==sf.PACKET_NO_FREE_INCOMING_CONNECTIONS then transport_closed,transport_retry_due=false,nil; queued,deadline=true,nil
@@ -880,11 +1055,13 @@ local function validate_runtime()
  end
  local required={'isSampAvailable','sampGetGamestate','sampGetCurrentServerAddress','sampGetCurrentServerName',
   'sampConnectToServer','sampRegisterChatCommand','sampAddChatMessage','sampIsLocalPlayerSpawned',
-  'setVirtualKeyDown','getCharCoordinates','getCharActiveInterior','getPlayerMoney',
-  'sampProcessChatInput','getWorkingDirectory',
-  'doesDirectoryExist','createDirectory','raknetBitStreamGetReadOffset',
+  'setVirtualKeyDown','getCharCoordinates','getCharModel','getCharActiveInterior','getPlayerMoney','getHeadingFromVector2d',
+  'setCharHeading','getAllChars','doesCharExist','setCharCollision',
+  'sampGetPlayerIdByCharHandle','sampProcessChatInput','getWorkingDirectory',
+  'doesDirectoryExist','createDirectory','raknetNewBitStream','raknetDeleteBitStream','raknetBitStreamGetReadOffset',
   'raknetBitStreamSetReadOffset','raknetBitStreamReadInt8','raknetBitStreamReadInt16','raknetBitStreamReadInt32',
-  'raknetBitStreamReadString','raknetBitStreamDecodeString'}
+  'raknetBitStreamReadString','raknetBitStreamDecodeString','raknetBitStreamWriteInt8','raknetBitStreamWriteInt16',
+  'raknetBitStreamWriteInt32','raknetBitStreamWriteString','raknetSendBitStreamEx'}
  for _,n in ipairs(required) do if type(_G[n])~='function' then return false,'runtime function is missing: '..n end end
  return true
 end
@@ -907,9 +1084,8 @@ function main()
  local vok,ve=validate_runtime(); if not vok then print('[PhoenixFBI] Incompatible MoonLoader: '..ve); return end
  local cok,ce=init_clock(); if not cok then print('[PhoenixFBI] Clock initialization failed: '..tostring(ce)); return end
  local dir=getWorkingDirectory()..'\\config'; if not doesDirectoryExist(dir) then createDirectory(dir) end
- config_path=dir..'\\PhoenixFBIGuard.ini'; stats_path=dir..'\\PhoenixFarmGuard_stats.csv'; log_path=getWorkingDirectory()..'\\PhoenixFBIGuard.log'
+ config_path=dir..'\\PhoenixFBIGuard.ini'; stats_path=dir..'\\PhoenixFBIGuard_stats.csv'; log_path=getWorkingDirectory()..'\\PhoenixFBIGuard.log'
  load_config()
- -- Old FBI, house and guard settings are ignored; only Farm settings are saved below.
  if not cfg.update_channel_initialized then
   cfg.update_manifest_url=DEFAULT_UPDATE_MANIFEST_URL
   cfg.update_channel_initialized=true
@@ -928,10 +1104,9 @@ function main()
   tell('Command /phmenu is already registered. The F10 panel hotkey remains available.',0xFFD280)
  end
  if not sampRegisterChatCommand('phstats',stats_command) then tell('Command /phstats is already registered.',0xFFD280) end
- if not sampRegisterChatCommand('phfarm',farm_command) then tell('Command /phfarm is already registered.',0xFFD280) end
  if not sampRegisterChatCommand('phupdate',update_command) then tell('Command /phupdate is already registered.',0xFFD280) end
  setup_gui()
- tell('v3.4.1 loaded. Farm spawn auto 5/6, wallet statistics and verified updater are ready. /phrec status')
+ tell('v3.5.0 loaded. FBI outfit, house #1577 and guard recovery are ready. /phrec status')
  while true do
   if isSampAvailable() then
    local step_ok,step_error=pcall(function()
@@ -940,10 +1115,10 @@ function main()
    end)
    if not step_ok then
     fatal='Runtime error; automation stopped. See PhoenixFBIGuard.log and moonloader.log.'
-    cfg.enabled,deadline=false,nil; release_keys(); tell(fatal,0xFF9090); log(tostring(step_error)); break
+    cfg.enabled,deadline=false,nil; release_keys(); restore_collision(); tell(fatal,0xFF9090); log(tostring(step_error)); break
    end
   end
   wait(S.poll_ms)
  end
- release_keys(); wait(-1)
+ release_keys(); restore_collision(); wait(-1)
 end

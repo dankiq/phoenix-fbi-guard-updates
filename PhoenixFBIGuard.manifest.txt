@@ -1,4 +1,4 @@
-version=3.4.1
-script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/0051679feb9ae02a1e4991b43f2eb11be5a79e09/phoenix_reconnect.lua
-sha256=6c45322d59c1819c477a4afdc5d21cfa062757ba30d6cd36a5199733e0a11c44
-notes=Farm spawn by name at item 5 or 6, 30-minute position watchdog and continuous reconnect
+version=3.5.0
+script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/b9d111f5fa6e8ba40aef4f0ef65ef34c8ffd5c8f/phoenix_reconnect.lua
+sha256=a2cd43387fc4433759a12822058070c2600d0cbc802312c412ae954e7ce0d316
+notes=FBI uniform recovery, house 1577 spawn, guard verification and restart reconnect

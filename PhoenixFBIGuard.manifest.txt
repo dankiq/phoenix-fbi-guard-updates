@@ -1,4 +1,4 @@
-version=3.5.0
-script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/b9d111f5fa6e8ba40aef4f0ef65ef34c8ffd5c8f/phoenix_reconnect.lua
-sha256=a2cd43387fc4433759a12822058070c2600d0cbc802312c412ae954e7ce0d316
-notes=FBI uniform recovery, house 1577 spawn, guard verification and restart reconnect
+version=3.5.1
+script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/8d1f02abe4d30193519a29e68364b0b77d749ed2/phoenix_reconnect.lua
+sha256=742efc953112c3f04dd894d5f0ebfb9810c7a5dccd8f97ecf503efc8726be325
+notes=Select house 1577 by spawn name and stop wrong-station relog loops

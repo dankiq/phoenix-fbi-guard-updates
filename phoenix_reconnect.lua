@@ -1,18 +1,18 @@
 script_name('Phoenix FBI Guard')
 script_author('Codex')
-script_version('3.5.1')
+script_version('3.5.2')
 script_description('Phoenix reconnect, FBI uniform recovery, guard summon and standing AFK')
 
 -- Calibrated from an official Arizona Launcher / Phoenix trace, 2026-09-14.
 -- The launcher performs account login. This file never reads credentials.
 
-local CURRENT_VERSION='3.5.1'
+local CURRENT_VERSION='3.5.2'
 local DEFAULT_UPDATE_MANIFEST_URL='https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/main/PhoenixFBIGuard.manifest.txt'
 
 local S = {
     poll_ms=50, retry_delay=30, max_retry_delay=300, restart_grace=120,
     join_timeout=180, stable_reset=60, login_attention_timeout=120,
-    spawn_screen_delay=1.45, spawn_list_grace=2, spawn_timeout=50, spawn_settle=1,
+    spawn_screen_delay=1.45, spawn_list_grace=2, spawn_direct_timeout=18, spawn_timeout=50, spawn_settle=1,
     route_timeout=65, route_stall=5, locker_timeout=15,
     guard_timeout=20, guard_cycle_timeout=40, collision_refresh=.5, key_step=.28,
     home_watch_interval=2, wait_connect_grace=45,
@@ -49,7 +49,8 @@ local temporary_password_lock,password_retry_due=false,nil
 local transport_closed,transport_retry_due,transport_close_reason=false,nil,nil
 local keys,held={},{}
 local collision={active=false,changed={},next_refresh=0}
-local ui={spawn_scheduled=false,spawn_pending_at=nil,inventory=false,locker=false,promo_due=nil}
+local ui={spawn_scheduled=false,spawn_pending_at=nil,spawn_fallback_at=nil,spawn_fallback_index=nil,
+ spawn_list_requested=false,inventory=false,locker=false,promo_due=nil}
 local flow={phase='BOOT',desired=nil,since=0,due=nil,spawned=false,spawn_at=nil,
  route_i=1,route_at=nil,best=nil,progress_at=nil,retries=0,locker_attempts=0,acted=nil,
  home_check_at=0,outfit_attempts=0,outfit_abandoned=false,guard_attempts=0,guard_started_at=nil,
@@ -412,49 +413,16 @@ local function phase(name,now,msg)
  if msg then tell(msg) end
 end
 local function clear_ui()
- ui.spawn_scheduled,ui.spawn_pending_at,ui.inventory,ui.locker,ui.promo_due=false,nil,false,false,nil
+ ui.spawn_scheduled,ui.spawn_pending_at,ui.spawn_fallback_at,ui.spawn_fallback_index=false,nil,nil,nil
+ ui.spawn_list_requested,ui.inventory,ui.locker,ui.promo_due=false,false,false,nil
  flow.spawned,flow.spawn_at=false,nil
 end
 local function default_destination()
  flow.desired=(not cfg.outfit_recovery or cfg.last_uniform or flow.outfit_abandoned) and 'home' or 'fbi'
 end
 
-local function spawn_index_from_list(message,destination)
- if not message or not message:find('event.auth.initializeSpawnPoints',1,true) then return nil end
- local count=0
- for label in message:gmatch('"spawn"%s*:%s*"([^"\\]*)"') do
-  count=count+1
-  local lower=label:lower()
-  if destination=='home' then
-   if label:find('1577',1,true) or lower:find('house',1,true) or
-      label:find('Дом',1,true) or label:find('дом',1,true) then return count end
-  elseif lower:find('fbi',1,true) or label:find('ФБР',1,true) or label:find('фбр',1,true) then
-   return count
-  end
- end
- return nil
-end
-
-local function schedule_spawn(now,message)
- if ui.spawn_scheduled or sampIsLocalPlayerSpawned() or not cfg.enabled then return end
- ui.spawn_scheduled=true; ui.spawn_pending_at=nil
- local parsed=spawn_index_from_list(message,flow.desired)
- local index=parsed
- if not index then
-  if flow.desired=='home' then index=HOME_SPAWN_INDEX+math.min(flow.home_spawn_attempts,1)
-  else index=FBI_SPAWN_INDEX end
- end
- flow.spawn_index,flow.spawn_confirmed=index,parsed~=nil
- local at=now+S.spawn_screen_delay
- for _=1,8 do pulse(VK_UP,at,.16); at=at+S.key_step end
- for _=2,index do pulse(VK_DOWN,at,.16); at=at+S.key_step end
- pulse(VK_RETURN,at,.20)
- phase('WAIT_SPAWN',now,string.format('Selecting %s spawn (menu item %d; %s).',
-  flow.desired=='home' and 'house #1577' or 'FBI organization',index,
-  parsed and 'matched by name' or 'fallback'))
-end
-
-local function send_cef(payload)
+local send_cef
+send_cef=function(payload)
  local bs
  local ok,e=pcall(function()
   bs=raknetNewBitStream()
@@ -465,6 +433,69 @@ local function send_cef(payload)
  if bs then pcall(raknetDeleteBitStream,bs) end
  if not ok then log('CEF send error: '..tostring(e)); return false end
  log('CEF sent: '..payload); return true
+end
+
+local function wanted_spawn(label,destination)
+ local lower=label:lower()
+ if destination=='home' then
+  return label:find('1577',1,true)~=nil or lower:find('house',1,true)~=nil or
+   label:find('Дом',1,true)~=nil or label:find('дом',1,true)~=nil
+ end
+ return lower:find('fbi',1,true)~=nil or label:find('ФБР',1,true)~=nil or label:find('фбр',1,true)~=nil
+end
+
+local function spawn_from_list(message,destination)
+ if not message or not message:find('event.auth.initializeSpawnPoints',1,true) then return nil,nil,nil end
+ local index=0
+ -- IDs in this list are launcher IDs and are not guaranteed to equal row numbers.
+ -- Keep each spawn label paired with the id from the same JSON object.
+ for object in message:gmatch('{(.-)}') do
+  local label=object:match('"spawn"%s*:%s*"([^"\\]*)"')
+  if label then
+   index=index+1
+   if wanted_spawn(label,destination) then
+    return index,tonumber(object:match('"id"%s*:%s*"?(%-?%d+)"?')),label
+   end
+  end
+ end
+ -- Some launcher builds wrap or escape the object text. Preserve name-based
+ -- keyboard selection when the objects themselves cannot be split reliably.
+ index=0
+ for label in message:gmatch('"spawn"%s*:%s*"([^"\\]*)"') do
+  index=index+1
+  if wanted_spawn(label,destination) then return index,nil,label end
+ end
+ return nil,nil,nil
+end
+
+local function keyboard_spawn(now,index,reason)
+ ui.spawn_fallback_at,ui.spawn_fallback_index=nil,nil
+ flow.spawn_index=index
+ local at=now+S.spawn_screen_delay
+ for _=1,8 do pulse(VK_UP,at,.16); at=at+S.key_step end
+ for _=2,index do pulse(VK_DOWN,at,.16); at=at+S.key_step end
+ pulse(VK_RETURN,at,.20)
+ phase('WAIT_SPAWN',now,string.format('Selecting %s spawn (menu item %d; %s).',
+  flow.desired=='home' and 'house #1577' or 'FBI organization',index,reason))
+end
+
+local function schedule_spawn(now,message)
+ if ui.spawn_scheduled or sampIsLocalPlayerSpawned() or not cfg.enabled then return end
+ ui.spawn_scheduled=true; ui.spawn_pending_at=nil
+ local index,id,label=spawn_from_list(message,flow.desired)
+ if index and id and send_cef('authSpawn|'..id) then
+  flow.spawn_index,flow.spawn_confirmed=index,true
+  ui.spawn_fallback_at,ui.spawn_fallback_index=now+S.spawn_direct_timeout,index
+  phase('WAIT_SPAWN',now,string.format('Selecting %s directly (launcher id %d, menu item %d: %s).',
+   flow.desired=='home' and 'house #1577' or 'FBI organization',id,index,label))
+  return
+ end
+ if not index then
+  if flow.desired=='home' then index=HOME_SPAWN_INDEX+math.min(flow.home_spawn_attempts,1)
+  else index=FBI_SPAWN_INDEX end
+ end
+ flow.spawn_index,flow.spawn_confirmed=index,label~=nil
+ keyboard_spawn(now,index,label and 'matched by name; launcher id unavailable' or 'fallback')
 end
 
 local function read_arizona(bs,sub)
@@ -713,6 +744,10 @@ local function flow_tick(now,state)
  tick_keys(now)
  if not cfg.enabled or state~=sf.GAMESTATE_CONNECTED then return end
  if ui.spawn_pending_at and now>=ui.spawn_pending_at then schedule_spawn(now) end
+ if ui.spawn_fallback_at and now>=ui.spawn_fallback_at and not sampIsLocalPlayerSpawned() then
+  local index=ui.spawn_fallback_index or flow.spawn_index or (flow.desired=='home' and HOME_SPAWN_INDEX or FBI_SPAWN_INDEX)
+  keyboard_spawn(now,index,'direct launcher selection was not answered; keyboard fallback')
+ end
  if not cfg.outfit_recovery and (flow.phase=='WALK_FBI' or flow.phase=='WAIT_LOCKER' or flow.phase=='WAIT_DRESS') then
   flow.outfit_abandoned=true; release_keys(); restore_collision()
   tell('Outfit recovery was disabled from the control panel; returning home.',0xFFD280); relog('home',now); return
@@ -728,7 +763,8 @@ local function flow_tick(now,state)
  end
  if not flow.spawned then
   temporary_password_lock,password_retry_due=false,nil
-  flow.spawned,flow.spawn_at=true,now; release_keys(); ui.spawn_scheduled=false
+  flow.spawned,flow.spawn_at=true,now; release_keys()
+  ui.spawn_scheduled,ui.spawn_fallback_at,ui.spawn_fallback_index=false,nil,nil
   phase('SPAWN_SETTLE',now,'Character appeared; checking location and FBI uniform.'); return
  end
  if flow.phase=='SPAWN_SETTLE' and now-flow.spawn_at>=S.spawn_settle then inspect_spawn(now)
@@ -1045,6 +1081,10 @@ function onReceivePacket(id,bs)
     if m:find('event.auth.initializeSpawnPoints',1,true) then
      schedule_spawn(clock(),m)
     elseif m:find('event.auth.updateVideoBackgroundVisible',1,true) and not ui.spawn_scheduled then
+     if not ui.spawn_list_requested then
+      ui.spawn_list_requested=true
+      send_cef('spawnSelection.getSpawns')
+     end
      ui.spawn_pending_at=ui.spawn_pending_at or clock()+S.spawn_list_grace
     end
    end
@@ -1145,7 +1185,7 @@ function main()
  if not sampRegisterChatCommand('phstats',stats_command) then tell('Command /phstats is already registered.',0xFFD280) end
  if not sampRegisterChatCommand('phupdate',update_command) then tell('Command /phupdate is already registered.',0xFFD280) end
  setup_gui()
- tell('v3.5.1 loaded. House #1577 is selected by spawn name with loop protection. /phrec status')
+ tell('v3.5.2 loaded. FBI and house #1577 are selected directly by launcher ID. /phrec status')
  while true do
   if isSampAvailable() then
    local step_ok,step_error=pcall(function()

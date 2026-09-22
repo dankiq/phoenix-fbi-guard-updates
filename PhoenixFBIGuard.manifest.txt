@@ -1,4 +1,4 @@
-version=3.5.1
-script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/8d1f02abe4d30193519a29e68364b0b77d749ed2/phoenix_reconnect.lua
-sha256=742efc953112c3f04dd894d5f0ebfb9810c7a5dccd8f97ecf503efc8726be325
-notes=Select house 1577 by spawn name and stop wrong-station relog loops
+version=3.5.2
+script_url=https://raw.githubusercontent.com/dankiq/phoenix-fbi-guard-updates/13c616ba3b1acdea56b060fe14ed12fc9a68f563/phoenix_reconnect.lua
+sha256=97776e604f72ed8bf58431c450c81617d88502497219afc807bd7d4464b9af2a
+notes=Select FBI and house 1577 directly by launcher spawn ID; keyboard is fallback only
